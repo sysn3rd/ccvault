@@ -185,9 +185,13 @@ the same one-shot loss as an uncaptured SHA. Go module scaffold, SQLite schema, 
 `version`, ignore unknown record types), `capture --hook`, `scan`, `install-hooks`, systemd
 timer + launchd plist. Ship this alone and it's already useful.
 
-**Phase 2 — Search.** FTS5 index seeded from `history.jsonl` and `ai-title` records,
-`ls` / `show` / `search`, bubbletea picker with the layout sketched during planning
-(title, cwd, relative time, kind, git ref, `dir_state`).
+**Phase 2 — Search.** ✅ Done. FTS5 index seeded from transcripts and from `history.jsonl`
+(which outlives pruned transcripts, so those sessions stay findable as `NO TRANSCRIPT`);
+`ls` / `show` / `search`; bubbletea picker matching the planned layout. Incremental search
+turns each term into a quoted FTS5 prefix query — passing raw input to the FTS parser makes
+ordinary punctuation a syntax error rather than a search. Enter hands off to
+`claude --resume`, and declines with an explanation for the two cases it cannot serve
+(deleted directory, pruned transcript).
 
 **Phase 3 — Restore.** Repo path first (cheap, high-confidence), then plain-tree snapshots.
 Dirty-patch capture and replay. `.claude/` fallback handling.

@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/sysn3rd/ccvault/internal/config"
@@ -16,13 +18,14 @@ import (
 	"github.com/sysn3rd/ccvault/internal/index"
 	"github.com/sysn3rd/ccvault/internal/ingest"
 	"github.com/sysn3rd/ccvault/internal/scheduler"
+	"github.com/sysn3rd/ccvault/internal/tui"
 )
 
 const usage = `ccvault — inventory and backup for Claude Code context
 
   ccvault scan [--force]        Ingest new or grown transcripts; refresh directory state
   ccvault ls                    List every known session
-  ccvault search <query>        Full-text search across titles, prompts and conversations
+  ccvault search [query]        Interactive picker; plain lines when piped
   ccvault show <uuid>           Everything known about one session
   ccvault status                Vault health
   ccvault install-hooks [-n]    Merge capture hooks into ~/.claude/settings.json
@@ -195,6 +198,9 @@ func runScan(args []string) error {
 	}
 	fmt.Printf("scanned %d  updated %d  skipped %d  failed %d\n",
 		res.Scanned, res.Updated, res.Skipped, res.Failed)
+	if res.Seeded > 0 {
+		fmt.Printf("recovered %d session(s) from the prompt log (transcripts already pruned)\n", res.Seeded)
+	}
 	return nil
 }
 
@@ -214,25 +220,68 @@ func runList(args []string) error {
 }
 
 func runSearch(args []string) error {
-	if len(args) == 0 {
-		return fmt.Errorf("search needs a query")
-	}
 	_, db, err := open()
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	sessions, err := db.Search(strings.Join(args, " "))
+	query := strings.Join(args, " ")
+
+	// Piped or redirected: emit plain lines and pass the query to FTS verbatim,
+	// so boolean syntax like `kali OR pentest` still works in scripts.
+	if !isTerminal() {
+		if query == "" {
+			sessions, err := db.List()
+			if err != nil {
+				return err
+			}
+			printTable(sessions)
+			return nil
+		}
+		sessions, err := db.Search(query)
+		if err != nil {
+			return err
+		}
+		if len(sessions) == 0 {
+			fmt.Println("no matches")
+			return nil
+		}
+		printTable(sessions)
+		return nil
+	}
+
+	res, err := tui.Run(db, query)
 	if err != nil {
 		return err
 	}
-	if len(sessions) == 0 {
-		fmt.Println("no matches")
-		return nil
+	if res.Action == tui.ActionResume && res.Session != nil {
+		return resume(res.Session)
 	}
-	printTable(sessions)
 	return nil
+}
+
+// resume hands the terminal to Claude Code. Resuming is not reimplemented here:
+// `claude --resume <uuid>` already works from any directory, so ccvault only has
+// to put the process in the right one.
+func resume(s *index.Session) error {
+	bin, err := exec.LookPath("claude")
+	if err != nil {
+		return fmt.Errorf("claude not found on PATH: %w", err)
+	}
+	if err := os.Chdir(s.CWD); err != nil {
+		return fmt.Errorf("cannot enter %s: %w", s.CWD, err)
+	}
+	// Replace this process outright; ccvault has nothing left to do.
+	return syscall.Exec(bin, []string{"claude", "--resume", s.UUID}, os.Environ())
+}
+
+func isTerminal() bool {
+	info, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
 }
 
 func runShow(args []string) error {
@@ -399,12 +448,19 @@ func currentBinary() string {
 
 func printTable(sessions []*index.Session) {
 	for _, s := range sessions {
-		state := ""
-		if s.DirState == index.DirMissing {
-			state = "  MISSING"
+		kind := s.Kind
+		if ref := s.GitRef(); ref != "" {
+			kind = s.Kind + " " + ref
 		}
-		fmt.Printf("%s  %-11s %-5s %s%s\n",
-			s.UUID[:8], relTime(s.LastActive), s.Kind, collapseHome(s.CWD), state)
+		state := "OK"
+		switch {
+		case !s.HasTranscript():
+			state = "NO TRANSCRIPT"
+		case s.DirState == index.DirMissing:
+			state = "MISSING"
+		}
+		fmt.Printf("%s  %-9s %-22s %s  [%s]\n",
+			s.UUID[:8], relTime(s.LastActive), kind, collapseHome(s.CWD), state)
 		fmt.Printf("          %s\n", orDash(firstLine(s.Title, s.FirstPrompt)))
 	}
 }

@@ -46,6 +46,31 @@ type Session struct {
 	SHA256      string
 	DirState    string
 	VaultPath   string
+
+	// Latest git provenance, joined in for display. Empty for plain directories.
+	Branch    string
+	HeadSHA   string
+	RemoteURL string
+}
+
+// HasTranscript reports whether ccvault holds a copy of the conversation.
+// It is false for sessions known only from ~/.claude/history.jsonl — Claude Code
+// prunes transcripts after cleanupPeriodDays (30 by default), but the prompt log
+// keeps the text, so the session stays searchable even once the context is gone.
+func (s *Session) HasTranscript() bool { return s.VaultPath != "" }
+
+// GitRef renders "branch@abcd1234" for display, or "" when there is no git state.
+func (s *Session) GitRef() string {
+	switch {
+	case s.Branch == "" && s.HeadSHA == "":
+		return ""
+	case s.HeadSHA == "":
+		return s.Branch
+	case len(s.HeadSHA) >= 8:
+		return s.Branch + "@" + s.HeadSHA[:8]
+	default:
+		return s.Branch + "@" + s.HeadSHA
+	}
 }
 
 type GitState struct {
@@ -224,10 +249,7 @@ func (db *DB) KnownTranscript(uuid string) (bytes int64, sha string, ok bool) {
 
 // Get returns one session by UUID, or nil when unknown.
 func (db *DB) Get(uuid string) (*Session, error) {
-	rows, err := db.sql.Query(`
-      SELECT uuid,cwd,cwds,slug,title,first_prompt,started_at,last_active,kind,
-             msg_count,cc_version,git_branch,bytes,sha256,dir_state,vault_path
-      FROM sessions WHERE uuid = ?`, uuid)
+	rows, err := db.sql.Query(selectSessions+` WHERE s.uuid = ?`, uuid)
 	if err != nil {
 		return nil, err
 	}
@@ -244,11 +266,21 @@ func (db *DB) SetDirState(uuid, state string) error {
 	return err
 }
 
+// selectSessions joins each session to its most recent git capture. A session
+// with no git_state rows still comes back, with empty git columns.
+const selectSessions = `
+  SELECT s.uuid,s.cwd,s.cwds,s.slug,s.title,s.first_prompt,s.started_at,s.last_active,
+         s.kind,s.msg_count,s.cc_version,s.git_branch,s.bytes,s.sha256,s.dir_state,s.vault_path,
+         COALESCE(g.branch,''),COALESCE(g.head_sha,''),COALESCE(g.remote_url,'')
+  FROM sessions s
+  LEFT JOIN (
+    SELECT session_uuid, branch, head_sha, remote_url,
+           ROW_NUMBER() OVER (PARTITION BY session_uuid ORDER BY captured_at DESC) AS rn
+    FROM git_state
+  ) g ON g.session_uuid = s.uuid AND g.rn = 1`
+
 func (db *DB) List() ([]*Session, error) {
-	rows, err := db.sql.Query(`
-      SELECT uuid,cwd,cwds,slug,title,first_prompt,started_at,last_active,kind,
-             msg_count,cc_version,git_branch,bytes,sha256,dir_state,vault_path
-      FROM sessions ORDER BY last_active DESC`)
+	rows, err := db.sql.Query(selectSessions + ` ORDER BY s.last_active DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -259,10 +291,8 @@ func (db *DB) List() ([]*Session, error) {
 // Search runs an FTS5 MATCH. The query is passed through, so FTS syntax works;
 // a bare word behaves as a prefix-free term match.
 func (db *DB) Search(q string) ([]*Session, error) {
-	rows, err := db.sql.Query(`
-      SELECT s.uuid,s.cwd,s.cwds,s.slug,s.title,s.first_prompt,s.started_at,s.last_active,
-             s.kind,s.msg_count,s.cc_version,s.git_branch,s.bytes,s.sha256,s.dir_state,s.vault_path
-      FROM sessions_fts f JOIN sessions s ON s.uuid = f.uuid
+	rows, err := db.sql.Query(selectSessions+`
+      JOIN sessions_fts f ON f.uuid = s.uuid
       WHERE sessions_fts MATCH ? ORDER BY bm25(sessions_fts), s.last_active DESC`, q)
 	if err != nil {
 		return nil, err
@@ -308,7 +338,8 @@ func scanSessions(rows *sql.Rows) ([]*Session, error) {
 		var cwds string
 		if err := rows.Scan(&s.UUID, &s.CWD, &cwds, &s.Slug, &s.Title, &s.FirstPrompt,
 			&started, &last, &s.Kind, &s.MsgCount, &s.CCVersion, &s.GitBranch,
-			&s.Bytes, &s.SHA256, &s.DirState, &s.VaultPath); err != nil {
+			&s.Bytes, &s.SHA256, &s.DirState, &s.VaultPath,
+			&s.Branch, &s.HeadSHA, &s.RemoteURL); err != nil {
 			return nil, err
 		}
 		json.Unmarshal([]byte(cwds), &s.CWDs)

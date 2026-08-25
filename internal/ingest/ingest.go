@@ -25,6 +25,9 @@ type Result struct {
 	Updated int
 	Skipped int
 	Failed  int
+	// Seeded counts sessions recovered from the prompt log alone, i.e. ones
+	// whose transcripts Claude Code has already pruned.
+	Seeded int
 }
 
 // Ingest processes one transcript file. event is "start", "end" or "scan" and is
@@ -152,6 +155,13 @@ func ScanAll(cfg *config.Config, db *index.DB, force bool) (*Result, error) {
 		}
 		res.Updated++
 	}
+
+	// Transcripts are the richer source, so this runs last and only fills gaps.
+	seeded, err := SeedFromHistory(cfg, db)
+	if err != nil {
+		return res, err
+	}
+	res.Seeded = seeded
 	return res, nil
 }
 

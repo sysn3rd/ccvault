@@ -209,3 +209,96 @@ func TestIndexIsOwnerOnly(t *testing.T) {
 		}
 	}
 }
+
+func writeHistory(t *testing.T, cfg *config.Config, lines ...string) {
+	t.Helper()
+	var body string
+	for _, l := range lines {
+		body += l + "\n"
+	}
+	if err := os.WriteFile(cfg.HistoryFile(), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Claude Code prunes transcripts after cleanupPeriodDays but keeps the prompt
+// log forever. Those sessions must stay findable, flagged as having no context.
+func TestSeedFromHistoryRecoversPrunedSessions(t *testing.T) {
+	cfg, db := newEnv(t)
+	writeHistory(t, cfg,
+		`{"display":"how do I play an audiobook from USB","timestamp":1787499114709,"project":"/home/u/Work","sessionId":"aaaa1111-0000-0000-0000-000000000000"}`,
+		`{"display":"try mpv instead","timestamp":1787499514709,"project":"/home/u/Work","sessionId":"aaaa1111-0000-0000-0000-000000000000"}`,
+	)
+
+	res, err := ScanAll(cfg, db, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Seeded != 1 {
+		t.Fatalf("Seeded = %d, want 1", res.Seeded)
+	}
+
+	got, err := db.Search("audiobook")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("search returned %d results, want 1", len(got))
+	}
+	s := got[0]
+	if s.HasTranscript() {
+		t.Error("HasTranscript() = true for a prompt-log-only session")
+	}
+	if s.MsgCount != 2 {
+		t.Errorf("MsgCount = %d, want 2", s.MsgCount)
+	}
+	if s.CWD != "/home/u/Work" {
+		t.Errorf("CWD = %q", s.CWD)
+	}
+	// The second prompt must be searchable too, not just the first.
+	if got, err := db.Search("mpv"); err != nil || len(got) != 1 {
+		t.Errorf("second prompt not indexed (got %d, err %v)", len(got), err)
+	}
+}
+
+// A transcript is strictly richer; the prompt log must never overwrite it.
+func TestSeedFromHistoryDoesNotClobberTranscripts(t *testing.T) {
+	cfg, db := newEnv(t)
+	const uuid = "bbbb2222-0000-0000-0000-000000000000"
+	dir := t.TempDir()
+	writeSession(t, cfg, "-p", uuid, dir, "the real transcript text")
+	writeHistory(t, cfg,
+		`{"display":"the real transcript text","timestamp":1787499114709,"project":"`+dir+`","sessionId":"`+uuid+`"}`,
+	)
+
+	res, err := ScanAll(cfg, db, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Seeded != 0 {
+		t.Errorf("Seeded = %d, want 0 — the transcript already covers it", res.Seeded)
+	}
+	s, err := db.Get(uuid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.HasTranscript() {
+		t.Error("transcript-backed session lost its vault copy")
+	}
+}
+
+func TestGitRefRendering(t *testing.T) {
+	cases := []struct {
+		branch, sha, want string
+	}{
+		{"main", "a2ac4b91aa52edb9c09cf4b93300940f8eee38b4", "main@a2ac4b91"},
+		{"main", "", "main"},
+		{"", "", ""},
+	}
+	for _, c := range cases {
+		s := &index.Session{Branch: c.branch, HeadSHA: c.sha}
+		if got := s.GitRef(); got != c.want {
+			t.Errorf("GitRef(%q,%q) = %q, want %q", c.branch, c.sha, got, c.want)
+		}
+	}
+}

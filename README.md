@@ -14,8 +14,8 @@ resumed.
 
 ## Status
 
-Phase 1 (capture and index) is complete and running. Search is CLI-only for now; the TUI
-picker and `restore` land in later phases. See [VISION.md](VISION.md).
+Phases 1 (capture and index) and 2 (search) are complete and running. `restore` — rebuilding
+a deleted directory — is phase 3. See [VISION.md](VISION.md).
 
 ## Install
 
@@ -32,11 +32,45 @@ touching it.
 ## Use
 
 ```sh
-ccvault ls                    # every known session, newest first
-ccvault search brightness     # full-text over titles, prompts and conversations
-ccvault search "kali OR pentest"
-ccvault show <uuid>           # metadata, git provenance, dirty patch, bundles
-ccvault status                # vault size, missing directories, hook health
+ccvault search               # interactive picker over every session
+ccvault search omar          # ...opened with a query already typed
+ccvault ls                   # plain listing, newest first
+ccvault show <uuid>          # metadata, git provenance, dirty patch, bundles
+ccvault status               # vault size, missing directories, hook health
+```
+
+### The picker
+
+```
+╭──────────────────────────────────────────────────────────────────────────╮
+│ > omar▊                                                                  │
+│ ──────────────────────────────────────────────────────────────────────── │
+│ ● Omarchy OS driver setup                                         ~/Work │
+│     1d ago · plain · OK                                                  │
+│   Custom theme for Omarchy OS                                     ~/Work │
+│     1d ago · plain · OK                                                  │
+│   Phase 3 task groups                             ~/code/TheLastAssembly │
+│     33m ago · repo main@a2ac4b91 · OK                                    │
+╰──────────────────────────────────────────────────────────────────────────╯
+ 8 session(s) · showing 1-3
+ enter resume · ^o open dir · ^y copy id · ^u clear · esc quit
+```
+
+Search is incremental and matches mid-word, so every term becomes an FTS5 prefix query.
+Arbitrary punctuation is quoted rather than passed to the FTS parser, where a stray `"` or
+`(` would be a syntax error instead of a search.
+
+`enter` hands the terminal to `claude --resume <uuid>` in the session'"'"'s directory —
+resumption is not reimplemented, because `--resume` already works from anywhere. Two cases
+Enter declines, with an explanation rather than a failure: a directory that no longer exists
+(that is phase 3) and a session Claude Code has already pruned.
+
+**Piped output stays plain**, and passes the query to FTS verbatim so boolean syntax works
+in scripts:
+
+```sh
+ccvault search "kali OR pentest" | head
+ccvault ls | grep MISSING
 ```
 
 ## How capture works
@@ -59,6 +93,10 @@ What gets stored per session, in `~/.local/share/ccvault` (mode `0700`, files `0
 | `patches/<uuid>-<ts>.patch` | `git diff --binary HEAD`, forced to canonical `a/`,`b/` prefixes |
 | `patches/<uuid>-<ts>.untracked.tar.gz` | untracked file **contents** — `git diff` does not cover these |
 | `index.db` | SQLite catalogue + FTS5 search index |
+
+Sessions are also seeded from `~/.claude/history.jsonl`. Claude Code prunes transcripts
+after `cleanupPeriodDays` (30 by default) but keeps the prompt log forever, so those
+sessions stay searchable — listed as `NO TRANSCRIPT`, since the context itself is gone.
 
 Git provenance recorded: remote URL, branch, commit SHA, dirty flag, submodules, and
 whether `.claude/` is tracked in the repo (an untracked one is silently lost by a
