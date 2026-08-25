@@ -3,6 +3,7 @@ package spawn
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -30,7 +31,7 @@ func TestCommandRunsInTheSessionDirectory(t *testing.T) {
 	dir := isolatePATH(t, "foot")
 	work := t.TempDir()
 
-	cmd, err := Command("", work, []string{"claude", "--resume", "abc123"})
+	cmd, err := detectCommand(work, []string{"claude", "--resume", "abc123"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +54,7 @@ func TestCommandRunsInTheSessionDirectory(t *testing.T) {
 // to the Claude session that replaces it.
 func TestCommandSetsADistinctAppID(t *testing.T) {
 	isolatePATH(t, "foot")
-	cmd, err := Command("", t.TempDir(), []string{"claude"})
+	cmd, err := detectCommand(t.TempDir(), []string{"claude"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +70,7 @@ func TestCommandSetsADistinctAppID(t *testing.T) {
 // it honours whichever terminal the user actually chose.
 func TestCommandPrefersTheFreedesktopEntryPoint(t *testing.T) {
 	isolatePATH(t, "xterm", "foot", "xdg-terminal-exec")
-	cmd, err := Command("", t.TempDir(), []string{"claude"})
+	cmd, err := detectCommand(t.TempDir(), []string{"claude"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +81,7 @@ func TestCommandPrefersTheFreedesktopEntryPoint(t *testing.T) {
 
 func TestCommandFallsBackThroughTheCandidates(t *testing.T) {
 	isolatePATH(t, "xterm")
-	cmd, err := Command("", t.TempDir(), []string{"claude"})
+	cmd, err := detectCommand(t.TempDir(), []string{"claude"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,10 +112,27 @@ func TestConfiguredTerminalOverridesDetection(t *testing.T) {
 	}
 }
 
+// The dispatcher must reach the right builder for the platform it is on.
+func TestCommandDispatchesByPlatform(t *testing.T) {
+	isolatePATH(t, "foot", "osascript")
+	cmd, err := Command("", t.TempDir(), []string{"claude"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := filepath.Base(cmd.Path)
+	want := "foot"
+	if runtime.GOOS == "darwin" {
+		want = "osascript"
+	}
+	if got != want {
+		t.Errorf("on %s Command chose %q, want %q", runtime.GOOS, got, want)
+	}
+}
+
 // With no terminal at all, the error has to say what to do about it.
 func TestNoTerminalGivesAnActionableError(t *testing.T) {
 	isolatePATH(t) // nothing installed
-	_, err := Command("", t.TempDir(), []string{"claude"})
+	_, err := detectCommand(t.TempDir(), []string{"claude"})
 	if err == nil {
 		t.Fatal("expected an error when no terminal exists")
 	}

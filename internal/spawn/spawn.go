@@ -38,21 +38,32 @@ var candidates = []Terminal{
 
 // Command builds the terminal invocation. override comes from the settings file
 // and wins outright; it is split on spaces and the command is appended.
+//
+// The platform-specific builders below are separate so each can be tested
+// anywhere, rather than only on the platform that happens to dispatch to it.
 func Command(override string, dir string, argv []string) (*exec.Cmd, error) {
-	if runtime.GOOS == "darwin" && override == "" {
+	if override != "" {
+		return overrideCommand(override, dir, argv)
+	}
+	if runtime.GOOS == "darwin" {
 		return macCommand(dir, argv)
 	}
+	return detectCommand(dir, argv)
+}
 
-	if override != "" {
-		fields := strings.Fields(override)
-		if len(fields) == 0 {
-			return nil, fmt.Errorf("picker.terminal is set but empty")
-		}
-		cmd := exec.Command(fields[0], append(fields[1:], argv...)...)
-		cmd.Dir = dir
-		return cmd, nil
+// overrideCommand honours a terminal named in the settings file.
+func overrideCommand(override string, dir string, argv []string) (*exec.Cmd, error) {
+	fields := strings.Fields(override)
+	if len(fields) == 0 {
+		return nil, fmt.Errorf("picker.terminal is set but empty")
 	}
+	cmd := exec.Command(fields[0], append(fields[1:], argv...)...)
+	cmd.Dir = dir
+	return cmd, nil
+}
 
+// detectCommand picks the first terminal on PATH that we know how to drive.
+func detectCommand(dir string, argv []string) (*exec.Cmd, error) {
 	for _, c := range candidates {
 		path, err := exec.LookPath(c.Name)
 		if err != nil {
