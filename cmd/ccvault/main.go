@@ -43,6 +43,9 @@ const usage = `ccvault — inventory and backup for Claude Code context
   ccvault install-hooks [-n]    Merge capture hooks into ~/.claude/settings.json
   ccvault install-timer [-n]    Install the periodic reconcile job (systemd / launchd)
   ccvault capture --hook        Internal: invoked by the hooks above (reads JSON on stdin)
+  ccvault version               Print the version
+
+Docs: https://github.com/sysn3rd/ccvault
 `
 
 func main() {
@@ -89,6 +92,9 @@ func main() {
 		err = runInstallHooks(args)
 	case "install-timer":
 		err = runInstallTimer(args)
+	case "version", "--version", "-v":
+		fmt.Println(versionString())
+		return
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return
