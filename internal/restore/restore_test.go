@@ -189,7 +189,7 @@ func TestRestoreWarnsOnUnpushedCommit(t *testing.T) {
 	if err := db.InsertGitState(&index.GitState{
 		SessionUUID: s.UUID, CapturedAt: time.Now(), Event: "end",
 		RemoteURL: remote, Branch: "main",
-		HeadSHA:   "0000000000000000000000000000000000000000",
+		HeadSHA: "0000000000000000000000000000000000000000",
 	}); err != nil {
 		t.Fatal(err)
 	}
