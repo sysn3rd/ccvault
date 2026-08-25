@@ -114,9 +114,9 @@ func TestEnterResumesLiveSession(t *testing.T) {
 	}
 }
 
-// Restore is phase 3; until then Enter on a deleted directory must say so
-// rather than launching Claude into a path that is not there.
-func TestEnterOnMissingDirectoryExplainsInsteadOfActing(t *testing.T) {
+// A deleted directory has to be rebuilt before Claude can be launched into it,
+// so Enter means restore rather than resume.
+func TestEnterOnMissingDirectoryRestores(t *testing.T) {
 	m, err := New(testDB(t), "")
 	if err != nil {
 		t.Fatal(err)
@@ -124,11 +124,55 @@ func TestEnterOnMissingDirectoryExplainsInsteadOfActing(t *testing.T) {
 	typeString(t, m, "godot")
 	key(t, m, tea.KeyEnter)
 
-	if m.result.Action != ActionNone {
-		t.Errorf("Action = %v, want ActionNone for a missing directory", m.result.Action)
+	if m.result.Action != ActionRestore {
+		t.Errorf("Action = %v, want ActionRestore for a missing directory", m.result.Action)
 	}
-	if !strings.Contains(m.status, "phase 3") {
-		t.Errorf("status = %q, want an explanation mentioning phase 3", m.status)
+	if m.result.Session.UUID != "11111111-0000-0000-0000-000000000000" {
+		t.Errorf("selected the wrong session: %s", m.result.Session.UUID)
+	}
+}
+
+// An empty directory resumes into somewhere useless, so it restores too.
+func TestEnterOnEmptyDirectoryRestores(t *testing.T) {
+	db := testDB(t)
+	if err := db.UpsertSession(&index.Session{
+		UUID: "44444444-0000-0000-0000-000000000000", CWD: "/home/u/code/emptied",
+		CWDs: []string{"/home/u/code/emptied"}, Title: "Emptied out",
+		Kind: index.KindPlain, DirState: index.DirEmpty, VaultPath: "/vault/4.jsonl",
+		LastActive: time.Now(),
+	}, "emptied session"); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := New(db, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	typeString(t, m, "emptied")
+	key(t, m, tea.KeyEnter)
+
+	if m.result.Action != ActionRestore {
+		t.Errorf("Action = %v, want ActionRestore for an empty directory", m.result.Action)
+	}
+}
+
+// The footer must name what Enter will actually do for the highlighted row.
+func TestFooterNamesTheAction(t *testing.T) {
+	m, err := New(testDB(t), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.width, m.height = 100, 30
+
+	typeString(t, m, "godot") // missing directory
+	if !strings.Contains(m.View(), "enter restore") {
+		t.Error("footer should offer restore for a missing directory")
+	}
+
+	key(t, m, tea.KeyCtrlU)
+	typeString(t, m, "task") // live directory
+	if !strings.Contains(m.View(), "enter resume") {
+		t.Error("footer should offer resume for a live directory")
 	}
 }
 
@@ -176,7 +220,7 @@ func TestViewShowsStateMarkers(t *testing.T) {
 	m.width, m.height = 100, 30
 	view := m.View()
 
-	for _, want := range []string{"MISSING", "NO TRANSCRIPT", "Fun game ideas", "enter resume"} {
+	for _, want := range []string{"MISSING", "NO TRANSCRIPT", "Fun game ideas", "^o open dir"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("view is missing %q", want)
 		}

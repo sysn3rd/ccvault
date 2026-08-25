@@ -14,8 +14,8 @@ resumed.
 
 ## Status
 
-Phases 1 (capture and index) and 2 (search) are complete and running. `restore` — rebuilding
-a deleted directory — is phase 3. See [VISION.md](VISION.md).
+Phases 1 (capture), 2 (search) and 3 (restore) are complete and running.
+See [VISION.md](VISION.md).
 
 ## Install
 
@@ -36,8 +36,58 @@ ccvault search               # interactive picker over every session
 ccvault search omar          # ...opened with a query already typed
 ccvault ls                   # plain listing, newest first
 ccvault show <uuid>          # metadata, git provenance, dirty patch, bundles
-ccvault status               # vault size, missing directories, hook health
+ccvault restore <uuid>       # rebuild the directory, then resume
+ccvault forget <uuid>        # drop a session from the vault
+ccvault status               # vault size, directory health, hook health
 ```
+
+UUID prefixes work everywhere a uuid is accepted, so `ccvault restore 9b782f76` is enough.
+
+## Restore
+
+```sh
+ccvault restore <uuid> -n           # show the plan, write nothing
+ccvault restore <uuid>              # rebuild, then resume
+ccvault restore <uuid> --to ~/tmp/x # rebuild somewhere else
+ccvault restore <uuid> --no-resume  # rebuild only
+ccvault restore <uuid> --fork       # resume into a new session id
+```
+
+```
+restore bd80b213  say only: E2E2
+  into     ~/code/project
+  strategy clone
+    · clone git@github.com:sysn3rd/project.git
+    · check out main at 25a062c8
+    · replay uncommitted changes
+    · restore untracked files
+    · restore .claude/ (not tracked by the repo)
+
+  ✓ cloned git@github.com:sysn3rd/project.git
+  ✓ checked out main at 25a062c8
+  ✓ replayed uncommitted changes
+  ✓ restored untracked files
+  ✓ restored .claude/
+```
+
+Two strategies, chosen by what was captured:
+
+- **clone** — a repository with a remote. Re-cloned at the exact commit, then the dirty
+  patch, the untracked files and (when the repo does not track it) `.claude/` are replayed
+  on top.
+- **snapshot** — anything else: a scratch workspace, or a repository with no remote, whose
+  archive then includes `.git` because nothing else holds its history.
+
+Safety:
+
+- The default target is the original directory, so Claude Code'"'"'s own `/resume` picker
+  works normally afterwards.
+- A directory that already has contents is refused unless you pass `--force`. An empty one
+  is fine — that is the common case.
+- A commit that was never pushed is not on the remote. That is reported as a warning and
+  the clone is left on its default branch, rather than failing with a raw git error.
+- A patch that will not apply warns and points at the patch file; the clone at the right
+  commit is already most of the value.
 
 ### The picker
 
@@ -92,7 +142,13 @@ What gets stored per session, in `~/.local/share/ccvault` (mode `0700`, files `0
 | `transcripts/<uuid>.jsonl` | full copy, so losing `~/.claude` does not lose context |
 | `patches/<uuid>-<ts>.patch` | `git diff --binary HEAD`, forced to canonical `a/`,`b/` prefixes |
 | `patches/<uuid>-<ts>.untracked.tar.gz` | untracked file **contents** — `git diff` does not cover these |
+| `snapshots/<treehash>.tar.gz` | whole-directory archive, for what git cannot cover |
 | `index.db` | SQLite catalogue + FTS5 search index |
+
+Archives are named by content, so the nine sessions that share `~/Work` reference one file
+rather than nine copies of it. Rebuildable directories (`node_modules`, `target`, `.venv`, …)
+are excluded, and every exclusion is recorded and surfaced at restore time rather than
+silently dropped.
 
 Sessions are also seeded from `~/.claude/history.jsonl`. Claude Code prunes transcripts
 after `cleanupPeriodDays` (30 by default) but keeps the prompt log forever, so those
@@ -110,6 +166,15 @@ clone-based restore, taking the project's skills and agents with it).
   untracked bundle. Cheap to store.
 - **`plain`** — not a repo at all (a scratch workspace like `~/Work`). No remote to clone,
   so restore means a tree snapshot.
+
+## Directory states
+
+| | |
+|---|---|
+| `OK` | the directory is there and has contents |
+| `EMPTY` | it exists but holds nothing — resuming lands you somewhere useless, so Enter restores |
+| `MISSING` | deleted; must be rebuilt before it can be resumed |
+| `NO TRANSCRIPT` | Claude Code pruned the conversation; the directory can still be rebuilt |
 
 ## The lossy-slug trap
 

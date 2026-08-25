@@ -17,6 +17,7 @@ import (
 	"github.com/sysn3rd/ccvault/internal/hooks"
 	"github.com/sysn3rd/ccvault/internal/index"
 	"github.com/sysn3rd/ccvault/internal/ingest"
+	"github.com/sysn3rd/ccvault/internal/restore"
 	"github.com/sysn3rd/ccvault/internal/scheduler"
 	"github.com/sysn3rd/ccvault/internal/tui"
 )
@@ -27,6 +28,9 @@ const usage = `ccvault — inventory and backup for Claude Code context
   ccvault ls                    List every known session
   ccvault search [query]        Interactive picker; plain lines when piped
   ccvault show <uuid>           Everything known about one session
+  ccvault restore <uuid>        Rebuild the session's directory, then resume
+                                  [--to DIR] [--force] [--no-resume] [--fork] [-n]
+  ccvault forget <uuid> [--yes] Drop a session from the vault (does not touch ~/.claude)
   ccvault status                Vault health
   ccvault install-hooks [-n]    Merge capture hooks into ~/.claude/settings.json
   ccvault install-timer [-n]    Install the periodic reconcile job (systemd / launchd)
@@ -59,6 +63,10 @@ func main() {
 		err = runSearch(args)
 	case "show":
 		err = runShow(args)
+	case "restore":
+		err = runRestore(args)
+	case "forget":
+		err = runForget(args)
 	case "status":
 		err = runStatus(args)
 	case "install-hooks":
@@ -183,8 +191,9 @@ func findTranscript(cfg *config.Config, uuid string) string {
 
 func runScan(args []string) error {
 	fs := flag.NewFlagSet("scan", flag.ExitOnError)
+
 	force := fs.Bool("force", false, "re-ingest every transcript, even unchanged ones")
-	fs.Parse(args)
+	fs.Parse(permute(fs, args))
 
 	cfg, db, err := open()
 	if err != nil {
@@ -255,25 +264,34 @@ func runSearch(args []string) error {
 	if err != nil {
 		return err
 	}
-	if res.Action == tui.ActionResume && res.Session != nil {
-		return resume(res.Session)
+	switch res.Action {
+	case tui.ActionResume:
+		return resumeIn(res.Session, res.Session.CWD, false)
+	case tui.ActionRestore:
+		return runRestore([]string{res.Session.UUID})
 	}
 	return nil
 }
 
-// resume hands the terminal to Claude Code. Resuming is not reimplemented here:
-// `claude --resume <uuid>` already works from any directory, so ccvault only has
-// to put the process in the right one.
-func resume(s *index.Session) error {
+// resumeIn hands the terminal to Claude Code. Resuming is not reimplemented
+// here: `claude --resume <uuid>` already works from any directory, so ccvault
+// only has to put the process in the right one.
+func resumeIn(s *index.Session, dir string, fork bool) error {
 	bin, err := exec.LookPath("claude")
 	if err != nil {
 		return fmt.Errorf("claude not found on PATH: %w", err)
 	}
-	if err := os.Chdir(s.CWD); err != nil {
-		return fmt.Errorf("cannot enter %s: %w", s.CWD, err)
+	if err := os.Chdir(dir); err != nil {
+		return fmt.Errorf("cannot enter %s: %w", dir, err)
+	}
+	argv := []string{"claude", "--resume", s.UUID}
+	if fork {
+		// Plain resume appends to the original transcript; forking leaves the
+		// archived one untouched.
+		argv = append(argv, "--fork-session")
 	}
 	// Replace this process outright; ccvault has nothing left to do.
-	return syscall.Exec(bin, []string{"claude", "--resume", s.UUID}, os.Environ())
+	return syscall.Exec(bin, argv, os.Environ())
 }
 
 func isTerminal() bool {
@@ -294,17 +312,17 @@ func runShow(args []string) error {
 	}
 	defer db.Close()
 
-	s, err := db.Get(args[0])
+	s, err := resolveSession(db, args[0])
 	if err != nil {
 		return err
-	}
-	if s == nil {
-		return fmt.Errorf("no session %s", args[0])
 	}
 
 	fmt.Printf("uuid        %s\n", s.UUID)
 	fmt.Printf("title       %s\n", orDash(s.Title))
 	fmt.Printf("cwd         %s  [%s]\n", s.CWD, s.DirState)
+	if !s.HasTranscript() {
+		fmt.Printf("            (prompt log only — Claude Code pruned the transcript)\n")
+	}
 	if len(s.CWDs) > 1 {
 		fmt.Printf("also ran in %s\n", strings.Join(s.CWDs[1:], "\n            "))
 	}
@@ -332,9 +350,178 @@ func runShow(args []string) error {
 		fmt.Printf("     .claude tracked in git: %t\n", g.ClaudeDirTracked)
 		fmt.Printf("     captured at %s (%s)\n", g.CapturedAt.Format(time.RFC3339), g.Event)
 	}
+	for _, kind := range []string{index.SnapTree, index.SnapClaude} {
+		snap, err := db.LatestSnapshot(s.UUID, kind)
+		if err != nil || snap == nil {
+			continue
+		}
+		fmt.Printf("\nsnapshot (%s)  %s\n", kind, snap.Path)
+		fmt.Printf("     %d file(s), %s, taken %s\n",
+			snap.FileCount, humanBytes(snap.Bytes), snap.CapturedAt.Format(time.RFC3339))
+		if snap.SkippedJSON != "" {
+			var skipped []string
+			if json.Unmarshal([]byte(snap.SkippedJSON), &skipped) == nil && len(skipped) > 0 {
+				fmt.Printf("     EXCLUDED %d path(s):\n", len(skipped))
+				for i, sk := range skipped {
+					if i >= 5 {
+						fmt.Printf("       … and %d more\n", len(skipped)-i)
+						break
+					}
+					fmt.Printf("       %s\n", sk)
+				}
+			}
+		}
+	}
+
 	if s.FirstPrompt != "" {
 		fmt.Printf("\nfirst prompt\n  %s\n", s.FirstPrompt)
 	}
+	return nil
+}
+
+func runRestore(args []string) error {
+	fs := flag.NewFlagSet("restore", flag.ExitOnError)
+
+	to := fs.String("to", "", "rebuild somewhere other than the original directory")
+	force := fs.Bool("force", false, "write into a directory that already has contents")
+	dry := fs.Bool("n", false, "show the plan without writing anything")
+	noResume := fs.Bool("no-resume", false, "rebuild the directory but do not launch Claude")
+	fork := fs.Bool("fork", false, "resume into a new session id, leaving the original transcript untouched")
+	fs.Parse(permute(fs, args))
+
+	if fs.NArg() == 0 {
+		return fmt.Errorf("restore needs a session uuid (see `ccvault ls`)")
+	}
+
+	_, db, err := open()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	s, err := resolveSession(db, fs.Arg(0))
+	if err != nil {
+		return err
+	}
+
+	plan, err := restore.Prepare(db, s, restore.Options{Target: *to, Force: *force})
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("restore %s  %s\n", s.UUID[:8], orDash(firstLine(s.Title, s.FirstPrompt)))
+	fmt.Printf("  into     %s\n", collapseHome(plan.Target))
+	fmt.Printf("  strategy %s\n", plan.Strategy)
+	for _, step := range plan.Steps {
+		fmt.Printf("    · %s\n", step)
+	}
+	for _, w := range plan.Warnings {
+		fmt.Printf("  ! %s\n", w)
+	}
+	if *dry {
+		fmt.Println("\n(dry run — nothing was written)")
+		return nil
+	}
+
+	fmt.Println()
+	report, err := restore.Execute(plan)
+	if err != nil {
+		return err
+	}
+	for _, c := range report.Completed {
+		fmt.Printf("  ✓ %s\n", c)
+	}
+	for _, w := range report.Warnings {
+		fmt.Printf("  ! %s\n", w)
+	}
+
+	if *noResume || !s.HasTranscript() {
+		fmt.Printf("\nrestored to %s\n", collapseHome(plan.Target))
+		if !s.HasTranscript() {
+			fmt.Println("(no transcript to resume — the directory is rebuilt, the conversation is not)")
+		}
+		return nil
+	}
+
+	fmt.Printf("\nresuming in %s\n", collapseHome(plan.Target))
+	return resumeIn(s, plan.Target, *fork)
+}
+
+// resolveSession accepts a full uuid or any unambiguous prefix, because nobody
+// types a uuid by hand.
+func resolveSession(db *index.DB, ref string) (*index.Session, error) {
+	if s, err := db.Get(ref); err == nil && s != nil {
+		return s, nil
+	}
+	all, err := db.List()
+	if err != nil {
+		return nil, err
+	}
+	var matches []*index.Session
+	for _, s := range all {
+		if strings.HasPrefix(s.UUID, ref) {
+			matches = append(matches, s)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return nil, fmt.Errorf("no session matching %q", ref)
+	case 1:
+		return matches[0], nil
+	default:
+		var ids []string
+		for _, m := range matches {
+			ids = append(ids, m.UUID[:8])
+		}
+		return nil, fmt.Errorf("%q matches %d sessions: %s", ref, len(matches), strings.Join(ids, ", "))
+	}
+}
+
+func runForget(args []string) error {
+	fs := flag.NewFlagSet("forget", flag.ExitOnError)
+	yes := fs.Bool("yes", false, "skip the confirmation prompt")
+	fs.Parse(permute(fs, args))
+
+	if fs.NArg() == 0 {
+		return fmt.Errorf("forget needs a session uuid")
+	}
+	_, db, err := open()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	s, err := resolveSession(db, fs.Arg(0))
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("forget %s  %s\n", s.UUID[:8], orDash(firstLine(s.Title, s.FirstPrompt)))
+	fmt.Printf("  %s\n", collapseHome(s.CWD))
+	fmt.Println("  This deletes ccvault's copies. Claude Code's own files are left alone,")
+	fmt.Println("  so a later scan will re-index the session unless you delete those too.")
+
+	if !*yes {
+		fmt.Print("\nProceed? [y/N] ")
+		var answer string
+		fmt.Scanln(&answer)
+		if !strings.EqualFold(strings.TrimSpace(answer), "y") {
+			fmt.Println("cancelled")
+			return nil
+		}
+	}
+
+	files, err := db.Forget(s.UUID)
+	if err != nil {
+		return err
+	}
+	removed := 0
+	for _, f := range files {
+		if err := os.Remove(f); err == nil {
+			removed++
+		}
+	}
+	fmt.Printf("forgot %s (%d file(s) removed)\n", s.UUID[:8], removed)
 	return nil
 }
 
@@ -345,24 +532,27 @@ func runStatus(args []string) error {
 	}
 	defer db.Close()
 
-	sessions, missing, bytes, err := db.Stats()
+	st, err := db.Stats()
 	if err != nil {
 		return err
 	}
-	fmt.Printf("vault        %s\n", cfg.VaultDir)
-	fmt.Printf("claude home  %s\n", cfg.ClaudeHome)
-	fmt.Printf("sessions     %d\n", sessions)
-	fmt.Printf("missing dirs %d\n", missing)
-	fmt.Printf("transcripts  %s\n", humanBytes(bytes))
+	fmt.Printf("vault         %s\n", cfg.VaultDir)
+	fmt.Printf("claude home   %s\n", cfg.ClaudeHome)
+	fmt.Printf("sessions      %d\n", st.Sessions)
+	fmt.Printf("  deleted dir %d\n", st.Missing)
+	fmt.Printf("  empty dir   %d\n", st.Empty)
+	fmt.Printf("  pruned      %d  (prompt log only)\n", st.NoTranscript)
+	fmt.Printf("transcripts   %s\n", humanBytes(st.TranscriptB))
+	fmt.Printf("snapshots     %s in %d file(s)\n", humanBytes(st.SnapshotB), st.SnapshotFiles)
 
 	installed, err := hooksInstalled(cfg)
 	if err != nil {
 		return err
 	}
 	if installed {
-		fmt.Println("hooks        installed")
+		fmt.Println("hooks         installed")
 	} else {
-		fmt.Println("hooks        NOT installed — run: ccvault install-hooks")
+		fmt.Println("hooks         NOT installed — run: ccvault install-hooks")
 	}
 	return nil
 }
@@ -377,8 +567,9 @@ func hooksInstalled(cfg *config.Config) (bool, error) {
 
 func runInstallHooks(args []string) error {
 	fs := flag.NewFlagSet("install-hooks", flag.ExitOnError)
+
 	dry := fs.Bool("n", false, "show what would change without writing")
-	fs.Parse(args)
+	fs.Parse(permute(fs, args))
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -411,8 +602,9 @@ func runInstallHooks(args []string) error {
 
 func runInstallTimer(args []string) error {
 	fs := flag.NewFlagSet("install-timer", flag.ExitOnError)
+
 	dry := fs.Bool("n", false, "show what would be written without writing")
-	fs.Parse(args)
+	fs.Parse(permute(fs, args))
 
 	plan, err := scheduler.Install(currentBinary(), *dry)
 	if err != nil {
@@ -435,6 +627,46 @@ func runInstallTimer(args []string) error {
 	return nil
 }
 
+// permute moves flags ahead of positional arguments.
+//
+// Go's flag package stops parsing at the first non-flag argument, so
+// `ccvault restore <uuid> -n` would silently treat -n as a positional and run a
+// real restore when a preview was asked for. Flags that take a value have that
+// value moved with them.
+func permute(fs *flag.FlagSet, args []string) []string {
+	var flags, positional []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			positional = append(positional, args[i+1:]...)
+			break
+		}
+		if len(a) < 2 || !strings.HasPrefix(a, "-") {
+			positional = append(positional, a)
+			continue
+		}
+		flags = append(flags, a)
+		name := strings.TrimLeft(a, "-")
+		if strings.Contains(name, "=") {
+			continue // value supplied inline
+		}
+		f := fs.Lookup(name)
+		if f == nil {
+			continue
+		}
+		if bf, ok := f.Value.(interface{ IsBoolFlag() bool }); ok && bf.IsBoolFlag() {
+			continue
+		}
+		if i+1 < len(args) {
+			i++
+			flags = append(flags, args[i])
+		}
+	}
+	// The explicit terminator makes flag.Parse stop at the same boundary we
+	// computed, so a positional that looks like a flag stays positional.
+	return append(append(flags, "--"), positional...)
+}
+
 func currentBinary() string {
 	exe, err := os.Executable()
 	if err != nil {
@@ -452,15 +684,8 @@ func printTable(sessions []*index.Session) {
 		if ref := s.GitRef(); ref != "" {
 			kind = s.Kind + " " + ref
 		}
-		state := "OK"
-		switch {
-		case !s.HasTranscript():
-			state = "NO TRANSCRIPT"
-		case s.DirState == index.DirMissing:
-			state = "MISSING"
-		}
 		fmt.Printf("%s  %-9s %-22s %s  [%s]\n",
-			s.UUID[:8], relTime(s.LastActive), kind, collapseHome(s.CWD), state)
+			s.UUID[:8], relTime(s.LastActive), kind, collapseHome(s.CWD), s.StateLabel())
 		fmt.Printf("          %s\n", orDash(firstLine(s.Title, s.FirstPrompt)))
 	}
 }

@@ -193,8 +193,14 @@ ordinary punctuation a syntax error rather than a search. Enter hands off to
 `claude --resume`, and declines with an explanation for the two cases it cannot serve
 (deleted directory, pruned transcript).
 
-**Phase 3 — Restore.** Repo path first (cheap, high-confidence), then plain-tree snapshots.
-Dirty-patch capture and replay. `.claude/` fallback handling.
+**Phase 3 — Restore.** ✅ Done. Both strategies, dirty-patch replay, untracked bundles and
+the `.claude/` fallback, all verified end to end by deleting a real directory and rebuilding
+it. Two capture bugs surfaced and are fixed: patches were being run through `TrimSpace`,
+which strips the trailing newline and makes git reject every one of them as "corrupt patch";
+and `ccvault restore <uuid> -n` silently performed a real restore, because Go'"'"'s flag package
+stops parsing at the first positional argument. Snapshot archives are content-addressed so
+sessions sharing a directory share one file. Added beyond the plan: a `forget` command, and
+an `EMPTY` directory state distinct from `OK`.
 
 **Phase 4 — Polish.** `status`, `gc`, macOS parity pass, Omarchy keybinding to launch the
 picker, README.

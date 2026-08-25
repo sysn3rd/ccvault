@@ -6,7 +6,6 @@
 package gitstate
 
 import (
-	"context"
 	"os/exec"
 	"strings"
 	"time"
@@ -70,7 +69,9 @@ func Capture(dir string) (*State, error) {
 		// Force canonical a/ and b/ prefixes and inline binary diffs. Without
 		// this the patch inherits local git config (diff.mnemonicPrefix emits
 		// c/ and w/), which may not apply on another machine.
-		s.Patch, _ = run(dir,
+		// runRaw, not run: a patch must keep its exact bytes. Trimming the
+		// trailing newline makes git reject the whole thing as "corrupt patch".
+		s.Patch, _ = runRaw(dir,
 			"-c", "diff.mnemonicPrefix=false",
 			"-c", "diff.noprefix=false",
 			"diff", "--binary", "HEAD")
@@ -89,16 +90,31 @@ func Capture(dir string) (*State, error) {
 	return s, nil
 }
 
+// runRaw returns git's output byte for byte. Used for patches, where trailing
+// whitespace is significant.
+func runRaw(dir string, args ...string) (string, error) {
+	out, err := command(dir, args...).Output()
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
 func run(dir string, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = dir
-	// Never let git stop for credentials or an editor inside a hook.
-	cmd.Env = append(cmd.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0")
-	out, err := cmd.Output()
+	out, err := command(dir, args...).Output()
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+func command(dir string, args ...string) *exec.Cmd {
+	// The timeout is bound to the command's lifetime via WaitDelay rather than a
+	// cancelled context, so the caller can run it after this returns.
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.WaitDelay = cmdTimeout
+	// Never let git stop for credentials or an editor inside a hook.
+	cmd.Env = append(cmd.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0")
+	return cmd
 }

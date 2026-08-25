@@ -8,6 +8,7 @@ package ingest
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -62,6 +63,10 @@ func Ingest(cfg *config.Config, db *index.DB, transcriptPath, event string, capt
 	var gs *gitstate.State
 	if dirExists(ts.CWD) {
 		s.DirState = index.DirOK
+		if empty, err := isEmptyDir(ts.CWD); err == nil && empty {
+			// Exists but holds nothing: resuming into it lands you nowhere useful.
+			s.DirState = index.DirEmpty
+		}
 		if captureGit {
 			gs, _ = gitstate.Capture(ts.CWD)
 		} else {
@@ -119,7 +124,42 @@ func Ingest(cfg *config.Config, db *index.DB, transcriptPath, event string, capt
 		})
 	}
 
+	// Snapshots are what make a non-git directory restorable at all. Hooks fire
+	// per session, so archiving there keeps growth proportional to sessions
+	// rather than to elapsed time; a bulk scan only backfills sessions that have
+	// never been archived, so the first run covers existing history exactly once.
+	if captureGit && gs != nil {
+		if event != "scan" || !hasAnySnapshot(db, ts.UUID) {
+			_ = captureSnapshot(cfg, db, ts.UUID, gs, ts.CWD)
+		}
+	}
+
 	return s, nil
+}
+
+func hasAnySnapshot(db *index.DB, uuid string) bool {
+	for _, kind := range []string{index.SnapTree, index.SnapClaude} {
+		if s, err := db.LatestSnapshot(uuid, kind); err == nil && s != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// isEmptyDir reports whether a directory has no entries at all.
+func isEmptyDir(p string) (bool, error) {
+	f, err := os.Open(p)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	// Readdirnames(1) returns io.EOF for an empty directory; any other error
+	// means we could not tell, and "not empty" is the safe answer.
+	names, err := f.Readdirnames(1)
+	if err != nil && err != io.EOF {
+		return false, err
+	}
+	return len(names) == 0, nil
 }
 
 // ScanAll walks every project shard and ingests anything new or grown.
@@ -143,6 +183,10 @@ func ScanAll(cfg *config.Config, db *index.DB, force bool) (*Result, error) {
 					// Unchanged transcript, but the directory may have been
 					// deleted since — that transition is the whole point.
 					_ = refreshDirState(db, uuid)
+					// A session whose transcript never grows again would
+					// otherwise never gain an archive, leaving it unrestorable
+					// even though its directory is still right there.
+					backfillSnapshot(cfg, db, uuid)
 					res.Skipped++
 					continue
 				}
@@ -165,6 +209,21 @@ func ScanAll(cfg *config.Config, db *index.DB, force bool) (*Result, error) {
 	return res, nil
 }
 
+// backfillSnapshot archives a session's directory if nothing has been archived
+// for it yet. Reconciling is the timer's job, and an unrestorable session whose
+// directory still exists is exactly the gap worth closing.
+func backfillSnapshot(cfg *config.Config, db *index.DB, uuid string) {
+	if hasAnySnapshot(db, uuid) {
+		return
+	}
+	s, err := db.Get(uuid)
+	if err != nil || s == nil || !dirExists(s.CWD) {
+		return
+	}
+	gs, _ := gitstate.Capture(s.CWD)
+	_ = captureSnapshot(cfg, db, uuid, gs, s.CWD)
+}
+
 func refreshDirState(db *index.DB, uuid string) error {
 	s, err := db.Get(uuid)
 	if err != nil || s == nil {
@@ -173,6 +232,9 @@ func refreshDirState(db *index.DB, uuid string) error {
 	want := index.DirMissing
 	if dirExists(s.CWD) {
 		want = index.DirOK
+		if empty, err := isEmptyDir(s.CWD); err == nil && empty {
+			want = index.DirEmpty
+		}
 	}
 	if want != s.DirState {
 		return db.SetDirState(uuid, want)

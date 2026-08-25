@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -28,6 +29,11 @@ func CopyTranscript(src, dstDir, uuid string) (string, error) {
 func WritePatch(dir, uuid string, at time.Time, patch string) (string, error) {
 	if patch == "" {
 		return "", nil
+	}
+	// git refuses a patch whose final line has no newline ("corrupt patch"),
+	// so guarantee one regardless of how the caller obtained the text.
+	if !strings.HasSuffix(patch, "\n") {
+		patch += "\n"
 	}
 	name := fmt.Sprintf("%s-%d.patch", uuid, at.Unix())
 	path := filepath.Join(dir, name)

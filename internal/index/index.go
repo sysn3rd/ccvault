@@ -27,6 +27,16 @@ const (
 const (
 	DirOK      = "ok"
 	DirMissing = "missing"
+	// DirEmpty is a directory that still exists but has nothing in it. Resuming
+	// into one lands you somewhere useless, so it is distinguished from DirOK
+	// and is restorable in place without --force.
+	DirEmpty = "empty"
+)
+
+// Snapshot kinds.
+const (
+	SnapTree   = "tree"   // the whole working directory
+	SnapClaude = "claude" // just .claude/, when the repo does not track it
 )
 
 type Session struct {
@@ -58,6 +68,27 @@ type Session struct {
 // prunes transcripts after cleanupPeriodDays (30 by default), but the prompt log
 // keeps the text, so the session stays searchable even once the context is gone.
 func (s *Session) HasTranscript() bool { return s.VaultPath != "" }
+
+// StateLabel is the single source of truth for how a session's health renders.
+// The picker and the plain listing both use it so they cannot drift apart.
+func (s *Session) StateLabel() string {
+	switch {
+	case !s.HasTranscript():
+		return "NO TRANSCRIPT"
+	case s.DirState == DirMissing:
+		return "MISSING"
+	case s.DirState == DirEmpty:
+		return "EMPTY"
+	default:
+		return "OK"
+	}
+}
+
+// NeedsRestore reports whether the directory must be rebuilt before Claude can
+// usefully be launched into it.
+func (s *Session) NeedsRestore() bool {
+	return s.DirState == DirMissing || s.DirState == DirEmpty
+}
 
 // GitRef renders "branch@abcd1234" for display, or "" when there is no git state.
 func (s *Session) GitRef() string {
@@ -149,6 +180,9 @@ CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
 var migrations = []string{
 	`ALTER TABLE git_state ADD COLUMN untracked_path TEXT`,
 	`ALTER TABLE git_state ADD COLUMN untracked_skipped_json TEXT`,
+	`ALTER TABLE snapshots ADD COLUMN skipped_json TEXT`,
+	`ALTER TABLE snapshots ADD COLUMN file_count INTEGER`,
+	`ALTER TABLE snapshots ADD COLUMN include_git INTEGER`,
 }
 
 func Open(path string) (*DB, error) {
@@ -321,13 +355,198 @@ func (db *DB) LatestGitState(uuid string) (*GitState, error) {
 	return g, nil
 }
 
-func (db *DB) Stats() (sessions, missing int, bytes int64, err error) {
-	err = db.sql.QueryRow(`SELECT COUNT(*), COALESCE(SUM(bytes),0) FROM sessions`).Scan(&sessions, &bytes)
+type Snapshot struct {
+	ID          int64
+	SessionUUID string
+	CapturedAt  time.Time
+	Kind        string
+	Path        string
+	Bytes       int64
+	// TreeHash identifies the directory contents; an unchanged directory
+	// produces the same hash, so a repeat snapshot can be skipped.
+	TreeHash    string
+	FileCount   int
+	IncludeGit  bool
+	SkippedJSON string
+}
+
+func (db *DB) InsertSnapshot(s *Snapshot) error {
+	_, err := db.sql.Exec(`
+    INSERT INTO snapshots (session_uuid,captured_at,kind,path,bytes,sha256,
+                           skipped_json,file_count,include_git)
+    VALUES (?,?,?,?,?,?,?,?,?)`,
+		s.SessionUUID, unix(s.CapturedAt), s.Kind, s.Path, s.Bytes, s.TreeHash,
+		s.SkippedJSON, s.FileCount, s.IncludeGit)
+	return err
+}
+
+// LatestSnapshot returns the newest snapshot of a kind, or nil when there is none.
+func (db *DB) LatestSnapshot(uuid, kind string) (*Snapshot, error) {
+	rows, err := db.sql.Query(`
+      SELECT id,session_uuid,captured_at,kind,path,bytes,COALESCE(sha256,''),
+             COALESCE(skipped_json,''),COALESCE(file_count,0),COALESCE(include_git,0)
+      FROM snapshots WHERE session_uuid = ? AND kind = ?
+      ORDER BY captured_at DESC LIMIT 1`, uuid, kind)
 	if err != nil {
-		return
+		return nil, err
 	}
-	err = db.sql.QueryRow(`SELECT COUNT(*) FROM sessions WHERE dir_state = ?`, DirMissing).Scan(&missing)
-	return
+	defer rows.Close()
+	out, err := scanSnapshots(rows)
+	if err != nil || len(out) == 0 {
+		return nil, err
+	}
+	return out[0], nil
+}
+
+// StaleSnapshots returns snapshots beyond the newest `keep` for a kind, so the
+// caller can delete their files and rows. Without this a directory that changes
+// between every session accumulates one archive per session forever.
+func (db *DB) StaleSnapshots(uuid, kind string, keep int) ([]*Snapshot, error) {
+	rows, err := db.sql.Query(`
+      SELECT id,session_uuid,captured_at,kind,path,bytes,COALESCE(sha256,''),
+             COALESCE(skipped_json,''),COALESCE(file_count,0),COALESCE(include_git,0)
+      FROM snapshots WHERE session_uuid = ? AND kind = ?
+      ORDER BY captured_at DESC LIMIT -1 OFFSET ?`, uuid, kind, keep)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanSnapshots(rows)
+}
+
+// CountSnapshotRefs reports how many rows still point at an archive. Snapshot
+// files are content-addressed and therefore shared, so one must never be
+// deleted while another session still references it.
+func (db *DB) CountSnapshotRefs(path string) (int, error) {
+	var n int
+	err := db.sql.QueryRow(`SELECT COUNT(*) FROM snapshots WHERE path = ?`, path).Scan(&n)
+	return n, err
+}
+
+func (db *DB) DeleteSnapshot(id int64) error {
+	_, err := db.sql.Exec(`DELETE FROM snapshots WHERE id = ?`, id)
+	return err
+}
+
+func scanSnapshots(rows *sql.Rows) ([]*Snapshot, error) {
+	var out []*Snapshot
+	for rows.Next() {
+		s := &Snapshot{}
+		var ts int64
+		if err := rows.Scan(&s.ID, &s.SessionUUID, &ts, &s.Kind, &s.Path, &s.Bytes,
+			&s.TreeHash, &s.SkippedJSON, &s.FileCount, &s.IncludeGit); err != nil {
+			return nil, err
+		}
+		s.CapturedAt = time.Unix(ts, 0)
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// Forget removes a session and everything stored for it, returning the vault
+// files the caller should delete. It touches only ccvault's own records —
+// ~/.claude is never modified.
+func (db *DB) Forget(uuid string) ([]string, error) {
+	var files []string
+	if s, err := db.Get(uuid); err == nil && s != nil && s.VaultPath != "" {
+		files = append(files, s.VaultPath)
+	}
+	rows, err := db.sql.Query(`
+      SELECT COALESCE(patch_path,''), COALESCE(untracked_path,'')
+      FROM git_state WHERE session_uuid = ?`, uuid)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var patch, untracked string
+		if err := rows.Scan(&patch, &untracked); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		for _, f := range []string{patch, untracked} {
+			if f != "" {
+				files = append(files, f)
+			}
+		}
+	}
+	rows.Close()
+
+	// Snapshot archives are content-addressed and shared between sessions, so
+	// only those with no other referrer are safe to delete.
+	snapRows, err := db.sql.Query(`
+      SELECT path FROM snapshots WHERE session_uuid = ? AND path != ''
+        AND (SELECT COUNT(*) FROM snapshots o WHERE o.path = snapshots.path
+             AND o.session_uuid != ?) = 0`, uuid, uuid)
+	if err != nil {
+		return nil, err
+	}
+	for snapRows.Next() {
+		var p string
+		if err := snapRows.Scan(&p); err != nil {
+			snapRows.Close()
+			return nil, err
+		}
+		files = append(files, p)
+	}
+	snapRows.Close()
+
+	tx, err := db.sql.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	for _, stmt := range []string{
+		`DELETE FROM sessions WHERE uuid = ?`,
+		`DELETE FROM sessions_fts WHERE uuid = ?`,
+		`DELETE FROM git_state WHERE session_uuid = ?`,
+		`DELETE FROM snapshots WHERE session_uuid = ?`,
+	} {
+		if _, err := tx.Exec(stmt, uuid); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return files, nil
+}
+
+type StatsResult struct {
+	Sessions      int
+	Missing       int
+	Empty         int
+	NoTranscript  int
+	TranscriptB   int64
+	SnapshotB     int64
+	SnapshotFiles int
+}
+
+func (db *DB) Stats() (*StatsResult, error) {
+	r := &StatsResult{}
+	if err := db.sql.QueryRow(`SELECT COUNT(*), COALESCE(SUM(bytes),0) FROM sessions`).
+		Scan(&r.Sessions, &r.TranscriptB); err != nil {
+		return nil, err
+	}
+	if err := db.sql.QueryRow(`SELECT COUNT(*) FROM sessions WHERE dir_state = ?`, DirMissing).
+		Scan(&r.Missing); err != nil {
+		return nil, err
+	}
+	if err := db.sql.QueryRow(`SELECT COUNT(*) FROM sessions WHERE dir_state = ?`, DirEmpty).
+		Scan(&r.Empty); err != nil {
+		return nil, err
+	}
+	if err := db.sql.QueryRow(`SELECT COUNT(*) FROM sessions WHERE vault_path = ''`).
+		Scan(&r.NoTranscript); err != nil {
+		return nil, err
+	}
+	// Distinct paths: archives are shared, so summing rows would double-count.
+	if err := db.sql.QueryRow(`
+      SELECT COUNT(*), COALESCE(SUM(bytes),0) FROM (
+        SELECT path, MAX(bytes) AS bytes FROM snapshots GROUP BY path)`).
+		Scan(&r.SnapshotFiles, &r.SnapshotB); err != nil {
+		return nil, err
+	}
+	return r, nil
 }
 
 func scanSessions(rows *sql.Rows) ([]*Session, error) {

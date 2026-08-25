@@ -21,6 +21,9 @@ type Action int
 const (
 	ActionNone Action = iota
 	ActionResume
+	// ActionRestore rebuilds the directory first. The picker only offers it when
+	// the directory is gone or empty.
+	ActionRestore
 )
 
 type Result struct {
@@ -186,9 +189,9 @@ func (m *model) choose() (tea.Model, tea.Cmd) {
 		m.status = "prompt log only — Claude Code pruned this transcript, there is no context to resume"
 		return m, nil
 	}
-	if s.DirState == index.DirMissing {
-		m.status = fmt.Sprintf("%s no longer exists — rebuilding it is phase 3", collapseHome(s.CWD))
-		return m, nil
+	if s.NeedsRestore() {
+		m.result = Result{Action: ActionRestore, Session: s}
+		return m, tea.Quit
 	}
 	m.result = Result{Action: ActionResume, Session: s}
 	return m, tea.Quit
@@ -274,7 +277,11 @@ func (m *model) View() string {
 	// `content` because every row is padded to it.
 	body := styleBorder.Render(strings.TrimRight(b.String(), "\n"))
 
-	footer := styleHelp.Render(" enter resume · ^o open dir · ^y copy id · ^u clear · esc quit")
+	action := "resume"
+	if s := m.selected(); s != nil && s.NeedsRestore() {
+		action = "restore"
+	}
+	footer := styleHelp.Render(" enter " + action + " · ^o open dir · ^y copy id · ^u clear · esc quit")
 	count := styleDim.Render(fmt.Sprintf(" %d session(s)", len(m.results)))
 	if m.top+rows < len(m.results) {
 		count = styleDim.Render(fmt.Sprintf(" %d session(s) · showing %d-%d", len(m.results), m.top+1, end))
@@ -310,14 +317,7 @@ func (m *model) renderRow(s *index.Session, selected bool, width int) string {
 	if ref := s.GitRef(); ref != "" {
 		meta[1] = s.Kind + " " + ref
 	}
-	switch {
-	case !s.HasTranscript():
-		meta = append(meta, "NO TRANSCRIPT")
-	case s.DirState == index.DirMissing:
-		meta = append(meta, "MISSING")
-	default:
-		meta = append(meta, "OK")
-	}
+	meta = append(meta, s.StateLabel())
 	line2 := pad(truncate("    "+strings.Join(meta, " · "), width), width)
 
 	return line1 + "\n" + styleDim.Render(line2) + "\n"

@@ -91,6 +91,9 @@ func TestScanMarksMissingDirectories(t *testing.T) {
 	cfg, db := newEnv(t)
 
 	live := t.TempDir()
+	if err := os.WriteFile(filepath.Join(live, "file.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	writeSession(t, cfg, "-live", "33333333-3333-3333-3333-333333333333", live, "still here")
 	writeSession(t, cfg, "-gone", "44444444-4444-4444-4444-444444444444", "/home/u/code/deleted-project", "long gone")
 
@@ -120,6 +123,9 @@ func TestScanSkipsUnchangedButStillRefreshesDirState(t *testing.T) {
 	cfg, db := newEnv(t)
 
 	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "file.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	writeSession(t, cfg, "-p", "55555555-5555-5555-5555-555555555555", dir, "hello")
 
 	res, err := ScanAll(cfg, db, false)
@@ -300,5 +306,207 @@ func TestGitRefRendering(t *testing.T) {
 		if got := s.GitRef(); got != c.want {
 			t.Errorf("GitRef(%q,%q) = %q, want %q", c.branch, c.sha, got, c.want)
 		}
+	}
+}
+
+// A directory that exists but holds nothing is not the same as a healthy one:
+// resuming into it lands you somewhere useless. ~/code/games on this machine is
+// exactly this case.
+func TestScanDistinguishesEmptyFromOK(t *testing.T) {
+	cfg, db := newEnv(t)
+
+	empty := t.TempDir()
+	populated := t.TempDir()
+	if err := os.WriteFile(filepath.Join(populated, "file.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeSession(t, cfg, "-e", "88888888-8888-8888-8888-888888888888", empty, "empty dir session")
+	writeSession(t, cfg, "-f", "99999999-9999-9999-9999-999999999999", populated, "populated dir session")
+
+	if _, err := ScanAll(cfg, db, false); err != nil {
+		t.Fatal(err)
+	}
+
+	e, err := db.Get("88888888-8888-8888-8888-888888888888")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.DirState != index.DirEmpty {
+		t.Errorf("empty directory marked %q, want %q", e.DirState, index.DirEmpty)
+	}
+	p, err := db.Get("99999999-9999-9999-9999-999999999999")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.DirState != index.DirOK {
+		t.Errorf("populated directory marked %q, want ok", p.DirState)
+	}
+}
+
+// A plain directory has no git safety net, so the archive is the only thing
+// that makes it restorable.
+func TestScanSnapshotsPlainDirectories(t *testing.T) {
+	cfg, db := newEnv(t)
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "notes.md"), []byte("important"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeSession(t, cfg, "-p", "aaaabbbb-0000-0000-0000-000000000000", dir, "plain work")
+
+	if _, err := ScanAll(cfg, db, false); err != nil {
+		t.Fatal(err)
+	}
+
+	snap, err := db.LatestSnapshot("aaaabbbb-0000-0000-0000-000000000000", index.SnapTree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap == nil {
+		t.Fatal("no tree snapshot taken for a plain directory")
+	}
+	if snap.FileCount != 1 {
+		t.Errorf("FileCount = %d, want 1", snap.FileCount)
+	}
+	if _, err := os.Stat(snap.Path); err != nil {
+		t.Errorf("snapshot file missing: %v", err)
+	}
+}
+
+// An idle directory must not accumulate an archive per capture event.
+func TestSnapshotSkippedWhenUnchanged(t *testing.T) {
+	cfg, db := newEnv(t)
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "notes.md"), []byte("stable"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(cfg.ProjectsDir(), "-p", "bbbbcccc-0000-0000-0000-000000000000.jsonl")
+	writeSession(t, cfg, "-p", "bbbbcccc-0000-0000-0000-000000000000", dir, "plain work")
+
+	for i := 0; i < 3; i++ {
+		if _, err := Ingest(cfg, db, path, "end", true); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	entries, err := os.ReadDir(cfg.SnapshotsDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("got %d archives after 3 unchanged captures, want 1", len(entries))
+	}
+}
+
+// The picker and the plain listing must never disagree about a session's health.
+func TestStateLabel(t *testing.T) {
+	cases := []struct {
+		name     string
+		s        index.Session
+		want     string
+		needsFix bool
+	}{
+		{"healthy", index.Session{VaultPath: "/v/x.jsonl", DirState: index.DirOK}, "OK", false},
+		{"deleted", index.Session{VaultPath: "/v/x.jsonl", DirState: index.DirMissing}, "MISSING", true},
+		{"emptied", index.Session{VaultPath: "/v/x.jsonl", DirState: index.DirEmpty}, "EMPTY", true},
+		// A pruned transcript outranks directory health: there is no context
+		// to resume either way.
+		{"pruned", index.Session{VaultPath: "", DirState: index.DirOK}, "NO TRANSCRIPT", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.s.StateLabel(); got != c.want {
+				t.Errorf("StateLabel() = %q, want %q", got, c.want)
+			}
+			if got := c.s.NeedsRestore(); got != c.needsFix {
+				t.Errorf("NeedsRestore() = %v, want %v", got, c.needsFix)
+			}
+		})
+	}
+}
+
+// Many sessions share one working directory — every session in ~/Work, for
+// instance. Naming archives by content means they share one file rather than
+// storing N identical copies.
+func TestSnapshotsAreSharedAcrossSessions(t *testing.T) {
+	cfg, db := newEnv(t)
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "shared.md"), []byte("same content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, uuid := range []string{
+		"cccc1111-0000-0000-0000-000000000000",
+		"cccc2222-0000-0000-0000-000000000000",
+		"cccc3333-0000-0000-0000-000000000000",
+	} {
+		writeSession(t, cfg, "-shared", uuid, dir, "session in the shared dir")
+	}
+	if _, err := ScanAll(cfg, db, false); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := os.ReadDir(cfg.SnapshotsDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("3 sessions sharing a directory produced %d archives, want 1", len(entries))
+	}
+
+	// Every session must still resolve to a usable archive.
+	for _, uuid := range []string{
+		"cccc1111-0000-0000-0000-000000000000",
+		"cccc3333-0000-0000-0000-000000000000",
+	} {
+		snap, err := db.LatestSnapshot(uuid, index.SnapTree)
+		if err != nil || snap == nil {
+			t.Fatalf("%s has no snapshot row", uuid[:8])
+		}
+		if _, err := os.Stat(snap.Path); err != nil {
+			t.Errorf("%s points at a missing archive: %v", uuid[:8], err)
+		}
+	}
+}
+
+// Forgetting one session must not delete an archive another still needs.
+func TestForgetKeepsSharedSnapshots(t *testing.T) {
+	cfg, db := newEnv(t)
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "shared.md"), []byte("same content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	keep := "dddd1111-0000-0000-0000-000000000000"
+	drop := "dddd2222-0000-0000-0000-000000000000"
+	writeSession(t, cfg, "-shared", keep, dir, "keep this one")
+	writeSession(t, cfg, "-shared", drop, dir, "drop this one")
+	if _, err := ScanAll(cfg, db, false); err != nil {
+		t.Fatal(err)
+	}
+
+	kept, err := db.LatestSnapshot(keep, index.SnapTree)
+	if err != nil || kept == nil {
+		t.Fatal("no snapshot for the session being kept")
+	}
+
+	files, err := db.Forget(drop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range files {
+		if f == kept.Path {
+			t.Fatal("Forget offered up an archive that another session still references")
+		}
+		os.Remove(f)
+	}
+	if _, err := os.Stat(kept.Path); err != nil {
+		t.Errorf("the surviving session's archive was deleted: %v", err)
+	}
+
+	// And the forgotten session is really gone.
+	if s, err := db.Get(drop); err != nil || s != nil {
+		t.Error("forgotten session is still in the index")
 	}
 }
