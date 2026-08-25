@@ -59,15 +59,17 @@ jobs:
         run: |
           git config --global user.email ci@example.com
           git config --global user.name CI
+      # scripts/coverage.sh does two things a plain `go test -cover` does not:
+      # attributes coverage across packages, and collects it from the binary the
+      # CLI tests run as a subprocess. Without both, the figure understates
+      # reality by roughly 24 points.
       - name: Measure
         run: |
-          go test -coverprofile=coverage.out ./...
-          go tool cover -func=coverage.out | tail -1
           {
             echo '### Coverage'
             echo
             echo '```'
-            go tool cover -func=coverage.out | grep -vE '\s0\.0%$' | tail -20
+            ./scripts/coverage.sh coverage.out | tee /dev/stderr
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4

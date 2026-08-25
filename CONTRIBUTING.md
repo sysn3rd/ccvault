@@ -28,6 +28,24 @@ GOOS=darwin GOARCH=arm64 go build ./cmd/ccvault    # if you touched platform-spe
 
 CI runs all of the above plus `govulncheck` and a coverage report, on Linux and macOS.
 
+### Coverage
+
+```sh
+./scripts/coverage.sh            # ~68%
+./scripts/coverage.sh out.prof   # ...and write a profile
+```
+
+Use the script rather than `go test -cover ./...`, which reports about 44% here and is
+wrong in two ways. It attributes coverage only to the package under test, so `internal/index`
+reads as 0% despite being exercised by nearly every other package. And it cannot see across
+a process boundary, so every command handler reads as untested even though `cli_test.go`
+drives all of them through the real binary. The script fixes both with `-coverpkg` and
+`GOCOVERDIR`, and passes `-count=1` because a cached test result runs no binary and so
+produces no coverage at all.
+
+Coverage is a proxy, not a target. Prefer a test that pins behaviour someone could plausibly
+break over one that lights up statements.
+
 ### Occasional checks
 
 Not gated in CI, because on this codebase they are mostly noise — but worth running by hand
@@ -117,6 +135,11 @@ than restating the code.
 capture hooks against one SQLite file through separate connections, which is the arrangement
 that actually happens in production. Without it, `go test -race` passing would only prove the
 tests are not racy.
+
+**The CLI is tested through the binary.** `cmd/ccvault/cli_test.go` builds ccvault and runs
+real subcommands against an isolated `HOME`. Every bug this project has had in the command
+layer lived in the seam between the user and the code — a flag read as a positional, a dry
+run that wrote to disk — and none were reachable by testing internals.
 
 **The transcript parser is fuzzed.** It reads an undocumented format written by another
 program, so `FuzzParse` asserts it is total: any bytes produce a session or an error, never a

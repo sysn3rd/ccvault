@@ -222,10 +222,22 @@ func captureOnce(fromHook bool) {
 		event = "end"
 	}
 
-	// A hook runs inside a live session and cannot stop to ask where the vault
-	// went. Holding the capture locally keeps the commit SHA and the diff,
-	// which nothing can reconstruct later, and leaves the decision to the user.
-	if cfg.Check().State != config.VaultOK {
+	switch cfg.Check().State {
+	case config.VaultOK:
+	case config.VaultUninitialised:
+		// First run, before anyone has typed a command: there is nothing to ask
+		// about, so create the vault rather than deferring. Holding a capture
+		// here would strand it until the user happened to run `pending adopt`.
+		if err := cfg.EnsureDirs(); err != nil {
+			return
+		}
+		_ = cfg.RememberVault()
+	default:
+		// The vault is genuinely unavailable — an unplugged drive, a deleted
+		// directory. A hook runs inside a live session and cannot stop to ask
+		// where it went, so the capture is held locally: that keeps the commit
+		// SHA and the diff, which nothing can reconstruct later, and leaves the
+		// decision to the user.
 		_ = ingest.CaptureDeferred(cfg, path, event)
 		return
 	}
@@ -283,6 +295,10 @@ func runList(args []string) error {
 	sessions, err := db.List()
 	if err != nil {
 		return err
+	}
+	if len(sessions) == 0 {
+		fmt.Println("no sessions indexed yet — run: ccvault scan")
+		return nil
 	}
 	printTable(sessions)
 	return nil
