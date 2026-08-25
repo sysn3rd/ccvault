@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -301,6 +302,13 @@ func (m *model) openDir() {
 		m.status = "directory is gone; nothing to open"
 		return
 	}
+	// A recorded working directory is always absolute. Anything else is
+	// malformed — and a path beginning with "-" would be read as a flag by the
+	// opener, the same way a "--upload-pack=" remote is by git.
+	if !filepath.IsAbs(s.CWD) {
+		m.status = "refusing to open " + s.CWD + ": not an absolute path"
+		return
+	}
 	opener := "xdg-open"
 	if runtime.GOOS == "darwin" {
 		opener = "open"
@@ -364,13 +372,14 @@ func (m *model) View() string {
 
 	rows := m.visibleRows()
 	end := min(m.top+rows, len(m.results))
-	if m.mode == modeActions {
+	switch m.mode {
+	case modeActions:
 		b.WriteString(m.renderActions(content))
 		b.WriteString("\n")
-	} else if m.mode == modeSettings {
+	case modeSettings:
 		b.WriteString(m.renderSettings(content))
 		b.WriteString("\n")
-	} else {
+	default:
 		for i := m.top; i < end; i++ {
 			b.WriteString(m.renderRow(m.results[i], i == m.cursor, content))
 		}

@@ -22,8 +22,30 @@ gofmt -l .          # must print nothing
 go vet ./...
 staticcheck ./...   # go install honnef.co/go/tools/cmd/staticcheck@latest
 go test ./...
-GOOS=darwin GOARCH=arm64 go build ./cmd/ccvault    # if you touched anything platform-specific
+go test -race ./... # a hook and the reconcile timer share one SQLite file
+GOOS=darwin GOARCH=arm64 go build ./cmd/ccvault    # if you touched platform-specific code
 ```
+
+CI runs all of the above plus `govulncheck` and a coverage report, on Linux and macOS.
+
+### Occasional checks
+
+Not gated in CI, because on this codebase they are mostly noise — but worth running by hand
+when you touch the relevant areas:
+
+```sh
+# Security scan. Most G204 "subprocess launched with variable" findings are inherent:
+# ccvault exists to shell out to git and open terminals. The defence is validating what
+# reaches them, not refusing to launch. Read past those; the rest is worth a look.
+golangci-lint run --no-config -E gosec ./...
+
+# Fuzz the transcript parser for longer than the weekly job does.
+go test ./internal/transcript/ -run FuzzParse -fuzz FuzzParse -fuzztime 10m
+```
+
+A one-off `gosec` run is what found an argument-injection bug in the directory opener, so
+these are worth doing occasionally even though continuous enforcement is not worth the
+exclusion list it would need.
 
 ## Reporting a bug
 
@@ -90,6 +112,16 @@ artefact you produce rather than asserting the behaviour you assume.
 
 Tests are named for the behaviour they protect, and comments say *why* a case matters rather
 than restating the code.
+
+**Concurrency is tested for real.** `TestConcurrentCaptureAndScan` runs a reconcile pass and
+capture hooks against one SQLite file through separate connections, which is the arrangement
+that actually happens in production. Without it, `go test -race` passing would only prove the
+tests are not racy.
+
+**The transcript parser is fuzzed.** It reads an undocumented format written by another
+program, so `FuzzParse` asserts it is total: any bytes produce a session or an error, never a
+panic. A panic there would surface as a broken Claude session, since the parser runs inside a
+capture hook.
 
 ## Code style
 

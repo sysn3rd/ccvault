@@ -671,7 +671,11 @@ func scanSessions(rows *sql.Rows) ([]*Session, error) {
 			&s.Branch, &s.HeadSHA, &s.RemoteURL); err != nil {
 			return nil, err
 		}
-		json.Unmarshal([]byte(cwds), &s.CWDs)
+		// A malformed cwds column should degrade to the primary directory
+		// rather than silently leaving a session with none recorded.
+		if err := json.Unmarshal([]byte(cwds), &s.CWDs); err != nil || len(s.CWDs) == 0 {
+			s.CWDs = []string{s.CWD}
+		}
 		s.StartedAt = time.Unix(started, 0)
 		s.LastActive = time.Unix(last, 0)
 		out = append(out, s)

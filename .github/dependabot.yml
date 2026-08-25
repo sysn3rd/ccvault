@@ -1,0 +1,22 @@
+version: 2
+updates:
+  # The Go toolchain pins these by checksum, so an unreviewed bump is not a
+  # supply-chain risk in itself — but a stale dependency with a known
+  # vulnerability is exactly what govulncheck would start failing on.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      go-dependencies:
+        patterns: ['*']
+
+  # Action versions drift and get deprecated; CI already warned about Node 20.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ['*']
