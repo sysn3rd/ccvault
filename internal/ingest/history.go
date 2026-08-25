@@ -42,13 +42,15 @@ func SeedFromHistory(cfg *config.Config, db *index.DB) (int, error) {
 	}
 	defer f.Close()
 
+	// Only the set of ids is needed here; List would join every session against
+	// its latest git capture to build the same set.
 	known := map[string]bool{}
-	existing, err := db.List()
+	ids, err := db.UUIDs()
 	if err != nil {
 		return 0, err
 	}
-	for _, s := range existing {
-		known[s.UUID] = true
+	for _, id := range ids {
+		known[id] = true
 	}
 
 	type agg struct {

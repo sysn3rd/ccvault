@@ -184,6 +184,7 @@ var migrations = []string{
 	`ALTER TABLE snapshots ADD COLUMN skipped_json TEXT`,
 	`ALTER TABLE snapshots ADD COLUMN file_count INTEGER`,
 	`ALTER TABLE snapshots ADD COLUMN include_git INTEGER`,
+	`ALTER TABLE sessions ADD COLUMN snapshot_checked_at INTEGER`,
 }
 
 func Open(path string) (*DB, error) {
@@ -294,6 +295,27 @@ func (db *DB) Get(uuid string) (*Session, error) {
 		return nil, err
 	}
 	return out[0], nil
+}
+
+// MarkSnapshotChecked records that the archiving decision has been made for a
+// session — including a decision that it needs no archive at all, which is the
+// normal answer for a repository whose remote already covers it. Without this,
+// every reconcile would re-evaluate those sessions forever, shelling out to git
+// each time.
+func (db *DB) MarkSnapshotChecked(uuid string) error {
+	_, err := db.sql.Exec(`UPDATE sessions SET snapshot_checked_at = ? WHERE uuid = ?`,
+		time.Now().Unix(), uuid)
+	return err
+}
+
+// SnapshotChecked reports whether that decision has already been made.
+func (db *DB) SnapshotChecked(uuid string) bool {
+	var at int64
+	if err := db.sql.QueryRow(
+		`SELECT COALESCE(snapshot_checked_at,0) FROM sessions WHERE uuid = ?`, uuid).Scan(&at); err != nil {
+		return false
+	}
+	return at > 0
 }
 
 func (db *DB) SetDirState(uuid, state string) error {

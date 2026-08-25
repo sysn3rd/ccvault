@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func git(t *testing.T, dir string, args ...string) {
@@ -128,5 +129,32 @@ func TestCaptureNonRepoIsNotAnError(t *testing.T) {
 	}
 	if s.IsRepo {
 		t.Error("IsRepo = true for a plain directory")
+	}
+}
+
+// A capture hook runs inside a live Claude session, so a git that hangs — on a
+// lock, on an unreachable remote — must not hang the session with it.
+func TestGitCallsAreBounded(t *testing.T) {
+	dir := t.TempDir()
+	hang := filepath.Join(dir, "hanging-git")
+	script := "#!/bin/sh\nsleep 60\n"
+	if err := os.WriteFile(hang, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	prevBinary, prevTimeout := gitBinary, cmdTimeout
+	gitBinary = hang
+	cmdTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { gitBinary, cmdTimeout = prevBinary, prevTimeout })
+
+	start := time.Now()
+	_, err := run(dir, "status")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Error("a command that never returns should produce an error")
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("git call took %v — it is not bounded by the timeout", elapsed)
 	}
 }

@@ -213,7 +213,8 @@ func ScanAll(cfg *config.Config, db *index.DB, force bool) (*Result, error) {
 // for it yet. Reconciling is the timer's job, and an unrestorable session whose
 // directory still exists is exactly the gap worth closing.
 func backfillSnapshot(cfg *config.Config, db *index.DB, uuid string) {
-	if hasAnySnapshot(db, uuid) {
+	// One cheap column read, rather than re-deciding from scratch.
+	if db.SnapshotChecked(uuid) || hasAnySnapshot(db, uuid) {
 		return
 	}
 	s, err := db.Get(uuid)

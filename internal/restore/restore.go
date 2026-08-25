@@ -63,6 +63,21 @@ type Report struct {
 
 const gitTimeout = 5 * time.Minute
 
+// NotCapturedError reports a session that cannot be rebuilt because nothing was
+// captured while its directory still existed — the case for every session that
+// predates ccvault. The explanation is kept out of Error() so the message stays
+// a single clause, and callers decide how much guidance to show.
+type NotCapturedError struct{ SessionID string }
+
+func (e *NotCapturedError) Error() string {
+	return fmt.Sprintf("nothing to restore from: %s has no remote and no archive", e.SessionID)
+}
+
+// Advice is the human explanation for why, suitable for printing beneath the error.
+func (e *NotCapturedError) Advice() string {
+	return "Only directories ccvault saw while they still existed can be rebuilt."
+}
+
 // Prepare works out how to rebuild a session's directory, and refuses up front
 // rather than half-way through.
 func Prepare(db *index.DB, s *index.Session, opts Options) (*Plan, error) {
@@ -88,6 +103,11 @@ func Prepare(db *index.DB, s *index.Session, opts Options) (*Plan, error) {
 
 	switch {
 	case gs != nil && gs.RemoteURL != "":
+		// Captured values reach git as arguments; refuse anything git could
+		// read as an option before a single byte is written.
+		if err := validateGitInputs(gs.RemoteURL, gs.Branch, gs.HeadSHA); err != nil {
+			return nil, err
+		}
 		p.Strategy = StrategyClone
 		p.RemoteURL = gs.RemoteURL
 		p.Branch = gs.Branch
@@ -115,9 +135,7 @@ func Prepare(db *index.DB, s *index.Session, opts Options) (*Plan, error) {
 			}
 		}
 	default:
-		return nil, fmt.Errorf(
-			"nothing to restore from: %s has no remote and no archive.\n"+
-				"Only directories ccvault saw while they still existed can be rebuilt.", short(s.UUID))
+		return nil, &NotCapturedError{SessionID: short(s.UUID)}
 	}
 
 	if !s.HasTranscript() {
@@ -205,7 +223,7 @@ func executeClone(p *Plan, r *Report) error {
 	if err := os.MkdirAll(filepath.Dir(p.Target), 0o755); err != nil {
 		return err
 	}
-	if _, err := git(".", "clone", p.RemoteURL, p.Target); err != nil {
+	if _, err := git(".", "clone", "--", p.RemoteURL, p.Target); err != nil {
 		return fmt.Errorf("cloning %s: %w", p.RemoteURL, err)
 	}
 	r.Completed = append(r.Completed, "cloned "+p.RemoteURL)
@@ -214,6 +232,8 @@ func executeClone(p *Plan, r *Report) error {
 		// The recorded commit may never have been pushed, in which case the
 		// clone simply does not contain it. Say so plainly and leave the clone
 		// on its default branch rather than failing with a raw git error.
+		// No "--" here: cat-file takes a revision, not a path. The SHA is
+		// already constrained to hex by validateGitInputs.
 		if _, err := git(p.Target, "cat-file", "-e", p.HeadSHA+"^{commit}"); err != nil {
 			r.Warnings = append(r.Warnings, fmt.Sprintf(
 				"commit %s is not on the remote (it was never pushed); the clone is on its default branch instead",
@@ -222,12 +242,14 @@ func executeClone(p *Plan, r *Report) error {
 		}
 		branch := p.Branch
 		if branch == "" || branch == "HEAD" {
+			// "--" would make git read the SHA as a pathspec ("--detach does
+			// not take a path argument"); validation is the defence here.
 			if _, err := git(p.Target, "checkout", "--detach", p.HeadSHA); err != nil {
 				return fmt.Errorf("checking out %s: %w", shortSHA(p.HeadSHA), err)
 			}
 			r.Completed = append(r.Completed, "checked out "+shortSHA(p.HeadSHA))
 		} else {
-			if _, err := git(p.Target, "checkout", "-B", branch, p.HeadSHA); err != nil {
+			if _, err := git(p.Target, "checkout", "-B", branch, p.HeadSHA, "--"); err != nil {
 				return fmt.Errorf("checking out %s at %s: %w", branch, shortSHA(p.HeadSHA), err)
 			}
 			r.Completed = append(r.Completed, fmt.Sprintf("checked out %s at %s", branch, shortSHA(p.HeadSHA)))
@@ -235,7 +257,7 @@ func executeClone(p *Plan, r *Report) error {
 	}
 
 	if p.PatchPath != "" {
-		if _, err := git(p.Target, "apply", "--3way", p.PatchPath); err != nil {
+		if _, err := git(p.Target, "apply", "--3way", "--", p.PatchPath); err != nil {
 			// A patch that will not apply is worth reporting, not aborting over:
 			// the clone at the right commit is already most of the value.
 			r.Warnings = append(r.Warnings,

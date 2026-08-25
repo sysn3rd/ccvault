@@ -195,7 +195,7 @@ func (m *model) updateSettings(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) renderSettings(width int) string {
-	var b stringBuilder
+	var b lineWriter
 	b.line(styleSelected.Render("Settings"))
 	b.line(styleDim.Render(truncate(m.cfg.Path, width)))
 	b.line("")

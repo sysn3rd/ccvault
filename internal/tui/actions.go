@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/sysn3rd/ccvault/internal/index"
 )
@@ -107,7 +108,7 @@ func (m *model) renderActions(width int) string {
 	if s == nil {
 		return ""
 	}
-	var b stringBuilder
+	var b lineWriter
 	b.line(styleSelected.Render(truncate(displayTitle(s), width)))
 	b.line(styleDim.Render(truncate(collapseHome(s.CWD)+"  ·  "+s.StateLabel(), width)))
 	b.line("")
@@ -141,20 +142,23 @@ func (m *model) renderActions(width int) string {
 	return b.String()
 }
 
-// stringBuilder keeps the rendering readable without repeating newline handling.
-type stringBuilder struct{ parts []string }
-
-func (b *stringBuilder) line(s string) { b.parts = append(b.parts, s) }
-func (b *stringBuilder) String() string {
-	out := ""
-	for i, p := range b.parts {
-		if i > 0 {
-			out += "\n"
-		}
-		out += p
-	}
-	return out
+// lineWriter joins rendered lines without repeating newline handling at every
+// call site, and without the quadratic string concatenation that doing it by
+// hand invites.
+type lineWriter struct {
+	b     strings.Builder
+	wrote bool
 }
+
+func (w *lineWriter) line(s string) {
+	if w.wrote {
+		w.b.WriteByte('\n')
+	}
+	w.b.WriteString(s)
+	w.wrote = true
+}
+
+func (w *lineWriter) String() string { return w.b.String() }
 
 func describeSelection(s *index.Session) string {
 	if s == nil {

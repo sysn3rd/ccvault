@@ -67,3 +67,31 @@ func TestPermuteRespectsDoubleDash(t *testing.T) {
 		t.Errorf("Arg(0) = %q, want -n", fs.Arg(0))
 	}
 }
+
+// Session ids become command-line arguments, so a value beginning with "-"
+// would be read as an option by whatever receives it.
+func TestSessionIDValidation(t *testing.T) {
+	valid := []string{
+		"9b782f76-cd42-486d-b83f-f78b8715c28b",
+		"9b782f76",
+		"ABCDEF01-2345-6789-abcd-ef0123456789",
+	}
+	for _, v := range valid {
+		if err := checkSessionID(v); err != nil {
+			t.Errorf("rejected a legitimate id %q: %v", v, err)
+		}
+	}
+	hostile := []string{
+		"--dangerously-skip-permissions",
+		"-p",
+		"; rm -rf /",
+		"../../etc/passwd",
+		"",
+		"short",
+	}
+	for _, v := range hostile {
+		if err := checkSessionID(v); err == nil {
+			t.Errorf("accepted %q", v)
+		}
+	}
+}

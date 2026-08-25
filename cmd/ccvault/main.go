@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -338,6 +339,9 @@ func runSearch(args []string) error {
 // here: `claude --resume <uuid>` already works from any directory, so ccvault
 // only has to put the process in the right one.
 func resumeIn(s *index.Session, dir string, fork bool) error {
+	if err := checkSessionID(s.UUID); err != nil {
+		return err
+	}
 	bin, err := exec.LookPath("claude")
 	if err != nil {
 		return fmt.Errorf("claude not found on PATH: %w", err)
@@ -359,6 +363,9 @@ func resumeIn(s *index.Session, dir string, fork bool) error {
 // The new window gets its own app id, so it does not inherit the window rules
 // that make the picker a small floating scratch window.
 func resumeInNewWindow(cfg *config.Config, s *index.Session) error {
+	if err := checkSessionID(s.UUID); err != nil {
+		return err
+	}
 	cmd, err := spawn.Command(cfg.Picker.Terminal, s.CWD, []string{"claude", "--resume", s.UUID})
 	if err != nil {
 		return err
@@ -367,6 +374,18 @@ func resumeInNewWindow(cfg *config.Config, s *index.Session) error {
 		return fmt.Errorf("could not open a terminal: %w", err)
 	}
 	fmt.Printf("opened %s in a new terminal\n", collapseHome(s.CWD))
+	return nil
+}
+
+// sessionIDPattern is the shape Claude Code writes. Session ids come from files
+// on disk and end up as command-line arguments, so they are constrained rather
+// than trusted: a value beginning with "-" would be read as an option.
+var sessionIDPattern = regexp.MustCompile(`^[0-9a-fA-F-]{8,64}$`)
+
+func checkSessionID(uuid string) error {
+	if !sessionIDPattern.MatchString(uuid) {
+		return fmt.Errorf("refusing to use %q as a session id: not the expected form", uuid)
+	}
 	return nil
 }
 
@@ -496,6 +515,11 @@ func runRestore(args []string) error {
 
 	plan, err := restore.Prepare(db, s, restore.Options{Target: *to, Force: *force})
 	if err != nil {
+		var notCaptured *restore.NotCapturedError
+		if errors.As(err, &notCaptured) {
+			fmt.Fprintf(os.Stderr, "ccvault: %v\n%s\n", err, notCaptured.Advice())
+			os.Exit(1)
+		}
 		return err
 	}
 

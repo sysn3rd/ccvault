@@ -6,6 +6,7 @@
 package gitstate
 
 import (
+	"context"
 	"os/exec"
 	"strings"
 	"time"
@@ -36,7 +37,9 @@ type State struct {
 	ClaudeDirExists  bool
 }
 
-const cmdTimeout = 10 * time.Second
+// cmdTimeout bounds every git call. A variable rather than a constant so the
+// timeout itself can be tested.
+var cmdTimeout = 10 * time.Second
 
 // Capture inspects dir. It never returns an error for "not a repo" — that is a
 // valid answer. Errors are reserved for git being unusable entirely.
@@ -90,10 +93,14 @@ func Capture(dir string) (*State, error) {
 	return s, nil
 }
 
+// gitBinary is a variable so tests can substitute a command that misbehaves;
+// nothing else should change it.
+var gitBinary = "git"
+
 // runRaw returns git's output byte for byte. Used for patches, where trailing
 // whitespace is significant.
 func runRaw(dir string, args ...string) (string, error) {
-	out, err := command(dir, args...).Output()
+	out, err := output(dir, args...)
 	if err != nil {
 		return "", err
 	}
@@ -101,20 +108,28 @@ func runRaw(dir string, args ...string) (string, error) {
 }
 
 func run(dir string, args ...string) (string, error) {
-	out, err := command(dir, args...).Output()
+	out, err := output(dir, args...)
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
 }
 
-func command(dir string, args ...string) *exec.Cmd {
-	// The timeout is bound to the command's lifetime via WaitDelay rather than a
-	// cancelled context, so the caller can run it after this returns.
-	cmd := exec.Command("git", args...)
+// output runs git under a deadline. The context must outlive the call to
+// Output, which is why it lives here rather than in a helper that only builds
+// the command: cancelling it early would kill the process before it ran, and
+// WaitDelay alone does not bound how long a hung git may take — it only limits
+// I/O cleanup once the process has exited or the context has been cancelled.
+// A hook runs inside a live Claude session, so an unbounded git is not an option.
+func output(dir string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, gitBinary, args...)
 	cmd.Dir = dir
-	cmd.WaitDelay = cmdTimeout
+	// Once the deadline kills the process, do not wait indefinitely for pipes.
+	cmd.WaitDelay = 2 * time.Second
 	// Never let git stop for credentials or an editor inside a hook.
 	cmd.Env = append(cmd.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0")
-	return cmd
+	return cmd.Output()
 }

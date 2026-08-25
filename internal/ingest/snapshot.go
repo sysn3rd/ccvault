@@ -56,6 +56,9 @@ func snapshotOptions(cfg *config.Config) snapshot.Options {
 // most recent archive and matching content is not rewritten.
 func captureSnapshot(cfg *config.Config, db *index.DB, uuid string, gs *gitstate.State, cwd string) error {
 	kind, opts, root, want := snapshotPlan(cfg, gs, cwd)
+	// The decision is recorded either way: "this needs no archive" is an answer
+	// worth remembering, not one worth recomputing every fifteen minutes.
+	defer func() { _ = db.MarkSnapshotChecked(uuid) }()
 	if !want || !dirExists(root) {
 		return nil
 	}

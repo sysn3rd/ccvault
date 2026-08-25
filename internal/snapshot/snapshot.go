@@ -233,6 +233,12 @@ func Extract(archivePath, dest string) error {
 		if err != nil {
 			return err
 		}
+		// Only regular files are ever archived, so anything else means the
+		// archive was modified. Symlink and hardlink entries in particular are
+		// the classic way to write outside the destination.
+		if hdr.Typeflag != tar.TypeReg {
+			continue
+		}
 		target, err := safeJoin(dest, hdr.Name)
 		if err != nil {
 			return err

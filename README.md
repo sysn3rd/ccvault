@@ -353,6 +353,7 @@ and think before putting it on a shared drive.
 - **`.claude/` is only recovered when ccvault archived it.** If your repo tracks it, a clone
   brings it back anyway.
 - **No encryption at rest yet**, and no sync between machines.
+- **No redaction.** ccvault stores what Claude Code stored.
 
 ## Development
 
@@ -366,7 +367,11 @@ Tests use synthetic fixtures and never touch a real `~/.claude` or vault —
 `CCVAULT_CLAUDE_HOME` and `CCVAULT_HOME` redirect both.
 
 See [DESIGN.md](DESIGN.md) for how it works internally, and for the two undocumented Claude
-Code behaviours that shaped the design.
+Code behaviours that shaped the design. [CONTRIBUTING.md](CONTRIBUTING.md) covers the
+invariants worth knowing before changing anything.
+
+Contributions are welcome. Security issues should go through
+[SECURITY.md](SECURITY.md) rather than a public issue.
 
 ## Licence
 

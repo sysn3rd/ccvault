@@ -510,3 +510,34 @@ func TestForgetKeepsSharedSnapshots(t *testing.T) {
 		t.Error("forgotten session is still in the index")
 	}
 }
+
+// A repository whose remote already covers it needs no archive — and that
+// answer must be remembered. Otherwise every reconcile re-decides it, shelling
+// out to git each time, forever.
+func TestSnapshotDecisionIsRememberedForSessionsNeedingNoArchive(t *testing.T) {
+	cfg, db := newEnv(t)
+
+	// A plain directory with nothing in it: snapshotPlan wants an archive but
+	// there is nothing to put in one, so no snapshot row is ever created.
+	empty := t.TempDir()
+	const uuid = "ffff0000-0000-0000-0000-000000000000"
+	writeSession(t, cfg, "-p", uuid, empty, "session in an empty directory")
+
+	if _, err := ScanAll(cfg, db, false); err != nil {
+		t.Fatal(err)
+	}
+	if !db.SnapshotChecked(uuid) {
+		t.Fatal("the decision was not recorded, so it will be retaken every scan")
+	}
+	if snap, _ := db.LatestSnapshot(uuid, index.SnapTree); snap != nil {
+		t.Error("an empty directory should not produce an archive")
+	}
+
+	// A later reconcile must short-circuit rather than re-evaluate.
+	if _, err := ScanAll(cfg, db, false); err != nil {
+		t.Fatal(err)
+	}
+	if !db.SnapshotChecked(uuid) {
+		t.Error("the recorded decision was lost")
+	}
+}

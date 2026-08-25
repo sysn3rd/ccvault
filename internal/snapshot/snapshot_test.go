@@ -1,6 +1,8 @@
 package snapshot
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -178,5 +180,48 @@ func TestSafeJoinRefusesTraversal(t *testing.T) {
 	}
 	if _, err := safeJoin("/tmp/dest", "sub/ok.txt"); err != nil {
 		t.Errorf("safeJoin rejected a legitimate path: %v", err)
+	}
+}
+
+// Only regular files are ever archived, so a symlink entry means the archive
+// was modified. Writing it out is how an attacker escapes the destination.
+func TestExtractIgnoresNonRegularEntries(t *testing.T) {
+	archive := filepath.Join(t.TempDir(), "tampered.tar.gz")
+	f, err := os.Create(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gz := gzip.NewWriter(f)
+	tw := tar.NewWriter(gz)
+
+	// A symlink pointing outside, and a legitimate file alongside it.
+	if err := tw.WriteHeader(&tar.Header{
+		Name: "escape", Typeflag: tar.TypeSymlink, Linkname: "../../../../etc/passwd", Mode: 0o777,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("legitimate")
+	if err := tw.WriteHeader(&tar.Header{
+		Name: "real.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len(body)),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	tw.Close()
+	gz.Close()
+	f.Close()
+
+	dest := t.TempDir()
+	if err := Extract(archive, dest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(dest, "escape")); !os.IsNotExist(err) {
+		t.Error("the symlink entry was written out")
+	}
+	got, err := os.ReadFile(filepath.Join(dest, "real.txt"))
+	if err != nil || string(got) != "legitimate" {
+		t.Errorf("the legitimate entry did not survive: %q %v", got, err)
 	}
 }
