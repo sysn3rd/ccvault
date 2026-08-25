@@ -231,6 +231,27 @@ it → Enter restores the repo at the right SHA with the dirty patch applied and
 - `~/.claude/settings.json` currently has no `hooks` block; `install-hooks` must merge into
   the existing keys (`skipDangerousModePermissionPrompt`, `theme`, `tui`), not overwrite.
 
+## Beyond the plan
+
+**Settings (`config.toml`).** The plan mentioned a settings file for snapshot policy; what
+made it necessary was subtler. ccvault runs from three places with no shared environment —
+CLI, hook, timer — so an exported variable reaches some and not others and silently splits
+the vault. Verified: an exported `CCVAULT_HOME` wrote to the alternate vault via the hook
+while the timer kept using the default.
+
+**External drives.** `vault move` relocates the store; availability checks distinguish an
+unmounted drive from a deleted directory using the filesystem the vault was recorded on,
+kept in local state that survives the drive going away. ccvault refuses to create a vault
+inside an unmounted mountpoint, which would otherwise be shadowed on remount.
+
+**A holding area for captures taken while the vault was away.** A hook cannot prompt, and
+skipping would permanently lose the commit SHA. Captures land in local state and move only
+when the user adopts them.
+
+**An action menu in the picker**, replacing the single guessed action, with unavailable
+options shown alongside the reason — and "open in a new terminal", because continuing in
+place traps the session in the floating picker window.
+
 ## Deferred (explicitly out of scope for v1)
 
 - Encrypted off-machine sync between Omarchy and the Mac — the vault design doesn't preclude

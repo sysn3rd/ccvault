@@ -12,10 +12,6 @@ import (
 	"github.com/sysn3rd/ccvault/internal/snapshot"
 )
 
-// SnapshotsKept is how many archives to retain per session per kind. A directory
-// that changes between every session would otherwise accumulate one forever.
-const SnapshotsKept = 3
-
 // snapshotPlan decides what a session needs archived, given its git state.
 //
 // The three cases, in order of how much git already covers:
@@ -25,20 +21,33 @@ const SnapshotsKept = 3
 //   - a repository with no remote has nowhere to be cloned from, so the archive
 //     must include .git or the history is lost.
 //   - a plain directory has no git safety net whatsoever.
-func snapshotPlan(gs *gitstate.State, cwd string) (kind string, opts snapshot.Options, root string, want bool) {
+func snapshotPlan(cfg *config.Config, gs *gitstate.State, cwd string) (kind string, opts snapshot.Options, root string, want bool) {
+	base := snapshotOptions(cfg)
 	if gs == nil || !gs.IsRepo {
-		return index.SnapTree, snapshot.Options{}, cwd, true
+		return index.SnapTree, base, cwd, true
 	}
 	if gs.RemoteURL == "" {
-		return index.SnapTree, snapshot.Options{IncludeGit: true}, gs.WorktreeRoot, true
+		withGit := base
+		withGit.IncludeGit = true
+		return index.SnapTree, withGit, gs.WorktreeRoot, true
 	}
 	if !gs.ClaudeDirTracked {
 		claudeDir := filepath.Join(gs.WorktreeRoot, ".claude")
 		if dirExists(claudeDir) {
-			return index.SnapClaude, snapshot.Options{}, claudeDir, true
+			return index.SnapClaude, base, claudeDir, true
 		}
 	}
 	return "", snapshot.Options{}, "", false
+}
+
+// snapshotOptions translates the settings file into archiving limits. A nil
+// ignore list is left nil so the snapshot package applies its own defaults.
+func snapshotOptions(cfg *config.Config) snapshot.Options {
+	return snapshot.Options{
+		IgnoreDirs:    cfg.Snapshots.IgnoreDirs,
+		MaxFileBytes:  int64(cfg.Snapshots.MaxFileMB) << 20,
+		MaxTotalBytes: int64(cfg.Snapshots.MaxTotalMB) << 20,
+	}
 }
 
 // captureSnapshot archives the session's directory when the plan calls for it.
@@ -46,7 +55,7 @@ func snapshotPlan(gs *gitstate.State, cwd string) (kind string, opts snapshot.Op
 // An unchanged directory costs one walk: the tree hash is compared against the
 // most recent archive and matching content is not rewritten.
 func captureSnapshot(cfg *config.Config, db *index.DB, uuid string, gs *gitstate.State, cwd string) error {
-	kind, opts, root, want := snapshotPlan(gs, cwd)
+	kind, opts, root, want := snapshotPlan(cfg, gs, cwd)
 	if !want || !dirExists(root) {
 		return nil
 	}
@@ -99,7 +108,7 @@ func captureSnapshot(cfg *config.Config, db *index.DB, uuid string, gs *gitstate
 		return err
 	}
 
-	pruneSnapshots(db, uuid, kind)
+	pruneSnapshots(db, uuid, kind, cfg.Retention.Snapshots)
 	return nil
 }
 
@@ -112,8 +121,8 @@ func reuseOrWrite(m *snapshot.Manifest, dest string) (int64, error) {
 	return snapshot.Write(m, dest)
 }
 
-func pruneSnapshots(db *index.DB, uuid, kind string) {
-	stale, err := db.StaleSnapshots(uuid, kind, SnapshotsKept)
+func pruneSnapshots(db *index.DB, uuid, kind string, keep int) {
+	stale, err := db.StaleSnapshots(uuid, kind, keep)
 	if err != nil {
 		return
 	}

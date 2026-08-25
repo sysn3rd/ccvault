@@ -3,6 +3,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -18,8 +19,10 @@ import (
 	"github.com/sysn3rd/ccvault/internal/hooks"
 	"github.com/sysn3rd/ccvault/internal/index"
 	"github.com/sysn3rd/ccvault/internal/ingest"
+	"github.com/sysn3rd/ccvault/internal/pending"
 	"github.com/sysn3rd/ccvault/internal/restore"
 	"github.com/sysn3rd/ccvault/internal/scheduler"
+	"github.com/sysn3rd/ccvault/internal/spawn"
 	"github.com/sysn3rd/ccvault/internal/tui"
 )
 
@@ -34,6 +37,9 @@ const usage = `ccvault — inventory and backup for Claude Code context
   ccvault forget <uuid> [--yes] Drop a session from the vault (does not touch ~/.claude)
   ccvault gc [-n] [--older-than DUR]  Reclaim space; never touches a live transcript
   ccvault status                Vault health
+  ccvault config [set K V]      Show or change settings (~/.config/ccvault/config.toml)
+  ccvault vault <init|move|status>  Create, relocate or inspect the vault
+  ccvault pending [adopt]       Captures held while the vault was unavailable
   ccvault install-hooks [-n]    Merge capture hooks into ~/.claude/settings.json
   ccvault install-timer [-n]    Install the periodic reconcile job (systemd / launchd)
   ccvault capture --hook        Internal: invoked by the hooks above (reads JSON on stdin)
@@ -71,6 +77,12 @@ func main() {
 		err = runForget(args)
 	case "gc":
 		err = runGC(args)
+	case "config":
+		err = runConfig(args)
+	case "vault":
+		err = runVault(args)
+	case "pending":
+		err = runPending(args)
 	case "status":
 		err = runStatus(args)
 	case "install-hooks":
@@ -85,6 +97,11 @@ func main() {
 		os.Exit(2)
 	}
 	if err != nil {
+		var unavailable *vaultUnavailable
+		if errors.As(err, &unavailable) {
+			unavailable.explain(os.Stderr)
+			os.Exit(1)
+		}
 		fmt.Fprintln(os.Stderr, "ccvault:", err)
 		os.Exit(1)
 	}
@@ -95,6 +112,24 @@ func open() (*config.Config, *index.DB, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+
+	// Never create a vault just because a directory happens to exist there.
+	// An unplugged drive leaves its mountpoint behind as an empty directory,
+	// and writing a fresh vault into it produces a decoy that the real vault
+	// reappears underneath on remount.
+	switch st := cfg.Check(); st.State {
+	case config.VaultOK:
+	case config.VaultUninitialised:
+		if err := cfg.EnsureDirs(); err != nil {
+			return nil, nil, err
+		}
+		if err := cfg.RememberVault(); err != nil {
+			return nil, nil, err
+		}
+	default:
+		return nil, nil, &vaultUnavailable{status: st, cfg: cfg}
+	}
+
 	if err := cfg.EnsureDirs(); err != nil {
 		return nil, nil, err
 	}
@@ -102,6 +137,7 @@ func open() (*config.Config, *index.DB, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	_ = cfg.RememberVault()
 	return cfg, db, nil
 }
 
@@ -158,11 +194,10 @@ func captureOnce(fromHook bool) {
 		return
 	}
 
-	cfg, db, err := open()
+	cfg, err := config.Load()
 	if err != nil {
 		return
 	}
-	defer db.Close()
 
 	path := p.TranscriptPath
 	if path == "" {
@@ -179,6 +214,20 @@ func captureOnce(fromHook bool) {
 	case "SessionEnd":
 		event = "end"
 	}
+
+	// A hook runs inside a live session and cannot stop to ask where the vault
+	// went. Holding the capture locally keeps the commit SHA and the diff,
+	// which nothing can reconstruct later, and leaves the decision to the user.
+	if cfg.Check().State != config.VaultOK {
+		_ = ingest.CaptureDeferred(cfg, path, event)
+		return
+	}
+
+	db, err := index.Open(cfg.DBPath())
+	if err != nil {
+		return
+	}
+	defer db.Close()
 	_, _ = ingest.Ingest(cfg, db, path, event, true)
 }
 
@@ -233,7 +282,7 @@ func runList(args []string) error {
 }
 
 func runSearch(args []string) error {
-	_, db, err := open()
+	cfg, db, err := open()
 	if err != nil {
 		return err
 	}
@@ -264,13 +313,15 @@ func runSearch(args []string) error {
 		return nil
 	}
 
-	res, err := tui.Run(db, query)
+	res, err := tui.Run(db, query, pendingCount())
 	if err != nil {
 		return err
 	}
 	switch res.Action {
 	case tui.ActionResume:
 		return resumeIn(res.Session, res.Session.CWD, false)
+	case tui.ActionResumeNewWindow:
+		return resumeInNewWindow(cfg, res.Session)
 	case tui.ActionRestore:
 		return runRestore([]string{res.Session.UUID})
 	}
@@ -296,6 +347,35 @@ func resumeIn(s *index.Session, dir string, fork bool) error {
 	}
 	// Replace this process outright; ccvault has nothing left to do.
 	return syscall.Exec(bin, argv, os.Environ())
+}
+
+// resumeInNewWindow opens a fresh terminal rather than taking over this one.
+// The new window gets its own app id, so it does not inherit the window rules
+// that make the picker a small floating scratch window.
+func resumeInNewWindow(cfg *config.Config, s *index.Session) error {
+	cmd, err := spawn.Command(cfg.Picker.Terminal, s.CWD, []string{"claude", "--resume", s.UUID})
+	if err != nil {
+		return err
+	}
+	if err := spawn.Detach(cmd); err != nil {
+		return fmt.Errorf("could not open a terminal: %w", err)
+	}
+	fmt.Printf("opened %s in a new terminal\n", collapseHome(s.CWD))
+	return nil
+}
+
+// pendingCount is how many sessions are held locally because the vault was
+// unavailable when they were captured.
+func pendingCount() int {
+	dir, err := config.PendingDir()
+	if err != nil {
+		return 0
+	}
+	store, err := pending.Open(dir)
+	if err != nil {
+		return 0
+	}
+	return store.Sessions()
 }
 
 func isTerminal() bool {
@@ -593,6 +673,7 @@ func runStatus(args []string) error {
 	}
 	fmt.Printf("vault         %s\n", cfg.VaultDir)
 	fmt.Printf("claude home   %s\n", cfg.ClaudeHome)
+	fmt.Printf("settings      %s\n", settingsSource(cfg))
 	fmt.Printf("sessions      %d\n", st.Sessions)
 	fmt.Printf("  deleted dir %d\n", st.Missing)
 	fmt.Printf("  empty dir   %d\n", st.Empty)
@@ -609,7 +690,15 @@ func runStatus(args []string) error {
 	} else {
 		fmt.Println("hooks         NOT installed — run: ccvault install-hooks")
 	}
+	pendingNote(os.Stdout)
 	return nil
+}
+
+func settingsSource(cfg *config.Config) string {
+	if cfg.Loaded {
+		return cfg.Path
+	}
+	return cfg.Path + "  (not created yet — defaults in use)"
 }
 
 func hooksInstalled(cfg *config.Config) (bool, error) {

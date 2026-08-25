@@ -12,6 +12,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/sysn3rd/ccvault/internal/config"
 	"github.com/sysn3rd/ccvault/internal/index"
 )
 
@@ -20,9 +21,12 @@ type Action int
 
 const (
 	ActionNone Action = iota
+	// ActionResume replaces the picker's own process with Claude.
 	ActionResume
-	// ActionRestore rebuilds the directory first. The picker only offers it when
-	// the directory is gone or empty.
+	// ActionResumeNewWindow opens a fresh terminal instead, which is what you
+	// want when the picker itself is a floating scratch window.
+	ActionResumeNewWindow
+	// ActionRestore rebuilds the directory first.
 	ActionRestore
 )
 
@@ -40,8 +44,31 @@ var (
 	styleHelp     = lipgloss.NewStyle().Faint(true)
 )
 
+type mode int
+
+const (
+	modeList mode = iota
+	modeActions
+	modeSettings
+)
+
 type model struct {
-	db      *index.DB
+	db           *index.DB
+	mode         mode
+	actions      []menuItem
+	actionCursor int
+	// pending is how many captures are waiting because the vault was away;
+	// shown as a banner so an unavailable vault never looks like lost work.
+	pending int
+
+	// settings editor state
+	cfg         *config.Config
+	fields      []field
+	fieldCursor int
+	editing     bool
+	editBuf     string
+	dirty       bool
+
 	input   string
 	results []*index.Session
 	cursor  int
@@ -62,12 +89,14 @@ func New(db *index.DB, initial string) (*model, error) {
 	return m, nil
 }
 
-// Run shows the picker and reports what the user chose.
-func Run(db *index.DB, initial string) (Result, error) {
+// Run shows the picker and reports what the user chose. pendingCount is shown
+// as a banner when captures are waiting because the vault was unavailable.
+func Run(db *index.DB, initial string, pendingCount int) (Result, error) {
 	m, err := New(db, initial)
 	if err != nil {
 		return Result{}, err
 	}
+	m.SetPending(pendingCount)
 	final, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
 	if err != nil {
 		return Result{}, err
@@ -105,6 +134,9 @@ func (m *model) refresh() error {
 	return nil
 }
 
+// SetPending records how many captures are held locally.
+func (m *model) SetPending(n int) { m.pending = n }
+
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -112,6 +144,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		switch m.mode {
+		case modeActions:
+			return m.updateActions(msg)
+		case modeSettings:
+			return m.updateSettings(msg)
+		}
 		switch msg.String() {
 		case "ctrl+c", "esc":
 			return m, tea.Quit
@@ -127,6 +165,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "enter":
 			return m.choose()
+
+		case ",":
+			m.openSettings()
+			return m, nil
 
 		case "ctrl+o":
 			m.openDir()
@@ -178,23 +220,76 @@ func (m *model) move(delta int) {
 	}
 }
 
-// choose acts on Enter. Restore is a later phase, so the two cases it cannot
-// handle are reported plainly rather than failing at exec time.
+// choose opens the action menu rather than acting immediately, so what happens
+// next is a visible choice rather than a guess about intent.
 func (m *model) choose() (tea.Model, tea.Cmd) {
 	s := m.selected()
 	if s == nil {
 		return m, nil
 	}
-	if !s.HasTranscript() {
-		m.status = "prompt log only — Claude Code pruned this transcript, there is no context to resume"
+	m.actions = actionsFor(s)
+	m.actionCursor = firstEnabled(m.actions)
+	m.mode = modeActions
+	m.status = ""
+	return m, nil
+}
+
+func (m *model) updateActions(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "left", "q":
+		m.mode = modeList
+		m.status = ""
+		return m, nil
+	case "ctrl+c":
+		return m, tea.Quit
+	case "up", "ctrl+p", "ctrl+k":
+		m.moveAction(-1)
+	case "down", "ctrl+n", "ctrl+j":
+		m.moveAction(1)
+	case "enter", "right":
+		return m.runAction()
+	}
+	return m, nil
+}
+
+func (m *model) moveAction(delta int) {
+	if len(m.actions) == 0 {
+		return
+	}
+	m.actionCursor = clamp(m.actionCursor+delta, 0, len(m.actions)-1)
+}
+
+func (m *model) runAction() (tea.Model, tea.Cmd) {
+	s := m.selected()
+	if s == nil || m.actionCursor >= len(m.actions) {
 		return m, nil
 	}
-	if s.NeedsRestore() {
+	item := m.actions[m.actionCursor]
+	if !item.enabled {
+		m.status = item.why
+		return m, nil
+	}
+
+	switch item.kind {
+	case actContinueHere:
+		m.result = Result{Action: ActionResume, Session: s}
+		return m, tea.Quit
+	case actNewTerminal:
+		m.result = Result{Action: ActionResumeNewWindow, Session: s}
+		return m, tea.Quit
+	case actRestore:
 		m.result = Result{Action: ActionRestore, Session: s}
 		return m, tea.Quit
+	case actOpenDir:
+		m.openDir()
+		m.mode = modeList
+		return m, nil
+	case actCopyID:
+		m.copyID()
+		m.mode = modeList
+		return m, nil
 	}
-	m.result = Result{Action: ActionResume, Session: s}
-	return m, tea.Quit
+	return m, nil
 }
 
 func (m *model) openDir() {
@@ -269,25 +364,49 @@ func (m *model) View() string {
 
 	rows := m.visibleRows()
 	end := min(m.top+rows, len(m.results))
-	for i := m.top; i < end; i++ {
-		b.WriteString(m.renderRow(m.results[i], i == m.cursor, content))
+	if m.mode == modeActions {
+		b.WriteString(m.renderActions(content))
+		b.WriteString("\n")
+	} else if m.mode == modeSettings {
+		b.WriteString(m.renderSettings(content))
+		b.WriteString("\n")
+	} else {
+		for i := m.top; i < end; i++ {
+			b.WriteString(m.renderRow(m.results[i], i == m.cursor, content))
+		}
 	}
 
 	// No explicit Width: the box sizes to its widest line, which is exactly
 	// `content` because every row is padded to it.
 	body := styleBorder.Render(strings.TrimRight(b.String(), "\n"))
 
-	action := "resume"
-	if s := m.selected(); s != nil && s.NeedsRestore() {
-		action = "restore"
+	footer := styleHelp.Render(" enter choose · , settings · ^o open dir · ^y copy id · esc quit")
+	switch m.mode {
+	case modeActions:
+		footer = styleHelp.Render(" enter run · esc back · ^c quit")
+	case modeSettings:
+		footer = styleHelp.Render(" enter edit · ^s save · esc back · ^c quit")
 	}
-	footer := styleHelp.Render(" enter " + action + " · ^o open dir · ^y copy id · ^u clear · esc quit")
 	count := styleDim.Render(fmt.Sprintf(" %d session(s)", len(m.results)))
 	if m.top+rows < len(m.results) {
 		count = styleDim.Render(fmt.Sprintf(" %d session(s) · showing %d-%d", len(m.results), m.top+1, end))
 	}
 
+	switch m.mode {
+	case modeActions:
+		count = styleDim.Render(" " + describeSelection(m.selected()))
+	case modeSettings:
+		count = styleDim.Render(" edit, then ^s to save")
+		if m.dirty {
+			count = styleWarn.Render(" unsaved changes")
+		}
+	}
+
 	out := body + "\n" + count + "\n" + footer
+	if m.pending > 0 {
+		out += "\n" + styleWarn.Render(fmt.Sprintf(
+			" %d capture(s) held while the vault was unavailable — ccvault pending adopt", m.pending))
+	}
 	if m.status != "" {
 		out += "\n" + styleWarn.Render(" "+m.status)
 	}

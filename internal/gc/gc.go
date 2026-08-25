@@ -17,11 +17,6 @@ import (
 	"github.com/sysn3rd/ccvault/internal/index"
 )
 
-// GitStatesKept is how many git captures to retain per session. The most recent
-// is what a restore uses; a couple more are cheap insurance against the newest
-// one having been taken at an unhelpful moment.
-const GitStatesKept = 3
-
 type Options struct {
 	// OlderThan prunes supporting evidence older than this. Zero disables age
 	// pruning, leaving only the per-session retention counts.
@@ -61,6 +56,13 @@ func Compute(cfg *config.Config, db *index.DB, opts Options) (*Plan, error) {
 		cutoff = time.Now().Add(-opts.OlderThan)
 	}
 
+	// The most recent capture is what a restore uses; a couple more are cheap
+	// insurance against the newest having been taken at an unhelpful moment.
+	keep := cfg.Retention.GitStates
+	if keep <= 0 {
+		keep = config.DefaultGitStatesKept
+	}
+
 	uuids, err := db.UUIDs()
 	if err != nil {
 		return nil, err
@@ -68,7 +70,7 @@ func Compute(cfg *config.Config, db *index.DB, opts Options) (*Plan, error) {
 
 	// Older git captures, with their patches and untracked bundles.
 	for _, uuid := range uuids {
-		stale, err := db.StaleGitStates(uuid, GitStatesKept, cutoff)
+		stale, err := db.StaleGitStates(uuid, keep, cutoff)
 		if err != nil {
 			return nil, err
 		}

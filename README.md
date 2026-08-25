@@ -98,14 +98,34 @@ Safety:
 │ ──────────────────────────────────────────────────────────────────────── │
 │ ● Omarchy OS driver setup                                         ~/Work │
 │     1d ago · plain · OK                                                  │
-│   Custom theme for Omarchy OS                                     ~/Work │
-│     1d ago · plain · OK                                                  │
 │   Phase 3 task groups                             ~/code/TheLastAssembly │
 │     33m ago · repo main@a2ac4b91 · OK                                    │
 ╰──────────────────────────────────────────────────────────────────────────╯
- 8 session(s) · showing 1-3
- enter resume · ^o open dir · ^y copy id · ^u clear · esc quit
+ 8 session(s) · showing 1-2
+ enter choose · , settings · ^o open dir · ^y copy id · esc quit
 ```
+
+`enter` opens an action menu rather than guessing what you meant. Options that cannot work
+yet are shown with the reason, not hidden:
+
+```
+Kali Linux virtual desktop setup          │  (no prompts)
+~/Work  ·  OK                             │  ~/code/games  ·  EMPTY
+                                          │
+› Open in a new terminal — leaves this    │  › Restore the directory — rebuild, then resume
+  Continue in this window — replaces it   │    Open in a new terminal  (unavailable)
+  Restore the directory  (unavailable)    │        the directory is empty — restore it first
+      the directory is already there      │    Continue in this window  (unavailable)
+  Open the directory                      │        the directory is empty — restore it first
+  Copy the session id                     │    Copy the session id
+```
+
+**Open in a new terminal** matters when the picker is itself a floating scratch window:
+continuing in place would leave your session trapped in it. The new window gets its own
+app id, so it does not inherit the picker'"'"'s window rules.
+
+Press `,` for the settings editor — the same values as the TOML file, edited in place,
+`^s` to save.
 
 Search is incremental and matches mid-word, so every term becomes an FTS5 prefix query.
 Arbitrary punctuation is quoted rather than passed to the FTS parser, where a stray `"` or
@@ -176,6 +196,87 @@ clone-based restore, taking the project's skills and agents with it).
 | `EMPTY` | it exists but holds nothing — resuming lands you somewhere useless, so Enter restores |
 | `MISSING` | deleted; must be rebuilt before it can be resumed |
 | `NO TRANSCRIPT` | Claude Code pruned the conversation; the directory can still be rebuilt |
+
+## Settings
+
+Settings live in `~/.config/ccvault/config.toml`, editable by hand, from the CLI, or in the
+picker (press `,`).
+
+```sh
+ccvault config                          # show effective settings and vault health
+ccvault config set vault_dir /mnt/backup/ccvault
+ccvault config init                     # write a commented file with current values
+ccvault config path
+```
+
+```toml
+vault_dir   = "/mnt/backup/ccvault"
+claude_home = "/home/you/.claude"
+
+[snapshots]
+max_file_mb  = 16
+max_total_mb = 256
+ignore_dirs  = ["node_modules", ".venv", "target"]
+
+[retention]
+snapshots_kept  = 3
+git_states_kept = 3
+
+[picker]
+terminal = ""   # blank auto-detects
+```
+
+**Settings belong in this file rather than the environment**, and that is not a style
+preference. ccvault runs from three places that do not share an environment: the CLI you
+type, a hook spawned inside a Claude session, and the reconcile timer. An exported
+`CCVAULT_HOME` reaches the hook — it inherits your shell — but not the timer, which has no
+shell at all. The result is two half-vaults, each holding part of your history. The env
+vars still work for tests, and `ccvault config` warns loudly when one is in effect.
+
+## Backing up to an external drive
+
+```sh
+ccvault vault move /mnt/backup/ccvault   # copy, verify, then switch settings over
+```
+
+The original is left in place; deleting the only copy of something irreplaceable is your
+call. `ccvault vault status` reports health at any time.
+
+When the drive is not there, ccvault **stops and asks** rather than guessing:
+
+```
+The vault is not available.
+
+  /mnt/backup/ccvault is an empty mountpoint — the drive holding the vault is not mounted
+  last seen 2h ago
+
+  1 session(s) were captured while the vault was away, held at
+  ~/.local/state/ccvault/pending (339.0 KB)
+  They are safe. `ccvault pending adopt` files them once the vault is back.
+
+What you can do:
+  · reconnect the drive, then run the command again
+  · point ccvault somewhere else:  ccvault config set vault_dir <path>
+```
+
+It distinguishes **an unmounted drive** (reconnect it) from **a deleted directory** (nothing
+to reconnect; recreate empty with `ccvault vault init`) by remembering which filesystem the
+vault was on, in local state that survives the drive going away. Critically, it will not
+create a fresh vault inside an unmounted mountpoint — that decoy would be shadowed by the
+real vault on remount, leaving two incomplete stores.
+
+### Captures taken while the drive was away
+
+A hook runs inside a live Claude session and can never stop to ask a question, so it cannot
+prompt for a new location. Skipping would permanently lose the commit SHA and the
+uncommitted diff. Instead it writes to a local holding area, and nothing leaves there until
+you say so:
+
+```sh
+ccvault pending           # what is held, and from which sessions
+ccvault pending adopt     # file it all into the vault
+ccvault pending discard   # throw it away (asks first)
+```
 
 ## Reclaiming space
 

@@ -228,11 +228,55 @@ func TestAgePruningKeepsTheNewest(t *testing.T) {
 			surviving++
 		}
 	}
-	if surviving != GitStatesKept {
-		t.Errorf("%d captures survived, want %d — retention must outrank age", surviving, GitStatesKept)
+	if surviving != config.DefaultGitStatesKept {
+		t.Errorf("%d captures survived, want %d — retention must outrank age", surviving, config.DefaultGitStatesKept)
 	}
 }
 
 func filepathName(uuid string, i int) string {
 	return uuid + "-" + string(rune('a'+i)) + ".patch"
+}
+
+// Retention is a setting, not a constant: the settings file must actually
+// change how much history is kept.
+func TestRetentionComesFromSettings(t *testing.T) {
+	cfg, db := newEnv(t)
+	cfg.Retention.GitStates = 1 // keep only the newest
+	const uuid = "55555555-0000-0000-0000-000000000000"
+
+	if err := db.UpsertSession(&index.Session{
+		UUID: uuid, CWD: "/w", LastActive: time.Now(),
+	}, "body"); err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for i := 0; i < 4; i++ {
+		p := touch(t, filepath.Join(cfg.PatchesDir(), uuid+"-"+string(rune('a'+i))+".patch"), 10)
+		paths = append(paths, p)
+		if err := db.InsertGitState(&index.GitState{
+			SessionUUID: uuid,
+			CapturedAt:  time.Now().Add(time.Duration(i) * time.Minute),
+			PatchPath:   p,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	plan, err := Compute(cfg, db, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Execute(db, plan); err != nil {
+		t.Fatal(err)
+	}
+
+	surviving := 0
+	for _, p := range paths {
+		if _, err := os.Stat(p); err == nil {
+			surviving++
+		}
+	}
+	if surviving != 1 {
+		t.Errorf("%d captures survived with git_states_kept=1, want 1", surviving)
+	}
 }
