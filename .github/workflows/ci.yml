@@ -84,22 +84,25 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: stable
           check-latest: true
       # Checks the dependency tree against the Go vulnerability database, and
       # reports only vulnerabilities actually reachable from this code.
       - name: govulncheck
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
           "$(go env GOPATH)/bin/govulncheck" ./...
 
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The linters run against the project rather than being part of it, so
+      # they get the current stable toolchain. The build and test jobs keep the
+      # minimum version go.mod claims, so CI proves that claim every run.
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: stable
           check-latest: true
 
       - name: gofmt
@@ -113,9 +116,12 @@ jobs:
 
       - run: go vet ./...
 
+      # Pinned, not @latest: an unpinned tool can break CI without any change
+      # here. staticcheck 0.8.x needs a newer Go than the version the test jobs
+      # pin, which is why this job uses the current stable toolchain instead.
       - name: staticcheck
         run: |
-          go install honnef.co/go/tools/cmd/staticcheck@latest
+          go install honnef.co/go/tools/cmd/staticcheck@v0.8.1
           "$(go env GOPATH)/bin/staticcheck" ./...
 
   cross-compile:
