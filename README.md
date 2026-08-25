@@ -376,9 +376,10 @@ and think before putting it on a shared drive.
 ## Development
 
 ```sh
-go test ./...            # everything
-go build ./...
-GOOS=darwin GOARCH=arm64 go build ./cmd/ccvault    # cross-compile check
+./scripts/qa.sh          # everything CI runs, in ~18s
+./scripts/qa.sh --quick  # the fast subset
+./scripts/coverage.sh    # coverage, measured correctly (~68%)
+go test ./...            # just the tests
 ```
 
 Tests use synthetic fixtures and never touch a real `~/.claude` or vault —

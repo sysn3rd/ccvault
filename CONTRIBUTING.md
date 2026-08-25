@@ -15,18 +15,36 @@ go test ./...
 Requires Go 1.25+ and git. Tests never touch a real vault or `~/.claude` —
 `CCVAULT_CLAUDE_HOME` and `CCVAULT_HOME` redirect both, and every test uses `t.TempDir()`.
 
-Before opening a pull request:
+Before opening a pull request, run everything CI runs:
+
+```sh
+./scripts/qa.sh           # ~18s: build, gofmt, vet, staticcheck, tests, race,
+                          # govulncheck, cross-compile, coverage
+./scripts/qa.sh --quick   # ~5s: skips race, govulncheck and cross-compile
+```
+
+A missing optional tool is reported as *skipped*, never as a pass — a green run you did not
+actually perform is worse than a red one. Install them with:
+
+```sh
+go install honnef.co/go/tools/cmd/staticcheck@latest
+go install golang.org/x/vuln/cmd/govulncheck@latest
+```
+
+Or run the pieces individually:
 
 ```sh
 gofmt -l .          # must print nothing
 go vet ./...
-staticcheck ./...   # go install honnef.co/go/tools/cmd/staticcheck@latest
+staticcheck ./...
 go test ./...
 go test -race ./... # a hook and the reconcile timer share one SQLite file
 GOOS=darwin GOARCH=arm64 go build ./cmd/ccvault    # if you touched platform-specific code
 ```
 
-CI runs all of the above plus `govulncheck` and a coverage report, on Linux and macOS.
+CI runs the same set on Linux and macOS. **Run the macOS build at least once** if you touch
+anything platform-specific: the spawn tests once passed on Linux while covering nothing on
+darwin, and only the macOS CI job caught it.
 
 ### Coverage
 
