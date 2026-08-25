@@ -14,7 +14,7 @@ resumed.
 
 ## Status
 
-Phases 1 (capture), 2 (search) and 3 (restore) are complete and running.
+All four planned phases are complete and running: capture, search, restore and polish.
 See [VISION.md](VISION.md).
 
 ## Install
@@ -38,6 +38,7 @@ ccvault ls                   # plain listing, newest first
 ccvault show <uuid>          # metadata, git provenance, dirty patch, bundles
 ccvault restore <uuid>       # rebuild the directory, then resume
 ccvault forget <uuid>        # drop a session from the vault
+ccvault gc                   # reclaim space
 ccvault status               # vault size, directory health, hook health
 ```
 
@@ -175,6 +176,50 @@ clone-based restore, taking the project's skills and agents with it).
 | `EMPTY` | it exists but holds nothing — resuming lands you somewhere useless, so Enter restores |
 | `MISSING` | deleted; must be rebuilt before it can be resumed |
 | `NO TRANSCRIPT` | Claude Code pruned the conversation; the directory can still be rebuilt |
+
+## Reclaiming space
+
+```sh
+ccvault gc -n                    # show what would go
+ccvault gc                       # collect
+ccvault gc --older-than 720h     # also prune supporting files older than 30 days
+```
+
+gc removes orphaned files (whatever `forget` or a manual deletion left behind) and git
+captures beyond the newest three per session. **A transcript any session still references
+is never a candidate** — it is the one thing that cannot be regenerated. Retention outranks
+age, so `--older-than` never strips the captures a restore would actually use.
+
+## Omarchy keybinding
+
+`SUPER + R` ("resume") opens the picker in a floating terminal:
+
+```lua
+-- ~/.config/hypr/bindings.lua
+o.bind("SUPER + R", "Resume Claude session", "omarchy-launch-or-focus-tui ccvault search")
+
+-- ~/.config/hypr/hyprland.lua
+o.window("org.omarchy.ccvault", { tag = "+floating-window" })
+```
+
+`launch or focus tui` reuses an already-open picker instead of stacking terminals, and the
+`floating-window` tag inherits Omarchy'"'"'s own treatment (float, centered, 875x600) rather
+than restating those rules. Close the picker with `esc` — the TUI holds the terminal in raw
+mode, so a window-manager close request does not reach it.
+
+## macOS
+
+The same binary, the same layout. `install-timer` writes a launchd agent instead of a
+systemd timer, `^o` uses `open` instead of `xdg-open`, and the clipboard falls back through
+`wl-copy` → `xclip` → `pbcopy`. The vault lives at `~/.local/share/ccvault` on both
+platforms deliberately, so the two machines stay symmetric.
+
+```sh
+GOOS=darwin GOARCH=arm64 go build -o ccvault ./cmd/ccvault
+```
+
+The generated launchd plist is XML-parsed in tests, so its structure is verified from Linux
+rather than assumed.
 
 ## The lossy-slug trap
 

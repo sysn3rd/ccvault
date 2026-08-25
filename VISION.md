@@ -202,8 +202,11 @@ stops parsing at the first positional argument. Snapshot archives are content-ad
 sessions sharing a directory share one file. Added beyond the plan: a `forget` command, and
 an `EMPTY` directory state distinct from `OK`.
 
-**Phase 4 — Polish.** `status`, `gc`, macOS parity pass, Omarchy keybinding to launch the
-picker, README.
+**Phase 4 — Polish.** ✅ Done. `gc` (orphans, superseded git captures, optional age pruning —
+never a referenced transcript, and retention outranks age); macOS parity verified by
+cross-compiling both arches and XML-parsing the generated launchd plist from Linux; a
+`SUPER + R` Omarchy keybinding that reuses `omarchy-launch-or-focus-tui` and the stock
+`floating-window` tag rather than hand-written window rules; README.
 
 ## Verification
 

@@ -42,7 +42,31 @@ func installSystemd(binary string, dryRun bool) (*Plan, error) {
 	}
 	dir := filepath.Join(home, ".config", "systemd", "user")
 
-	service := fmt.Sprintf(`[Unit]
+	plan := &Plan{Files: []string{
+		filepath.Join(dir, "ccvault-scan.service"),
+		filepath.Join(dir, "ccvault-scan.timer"),
+	}}
+	if dryRun {
+		return plan, nil
+	}
+
+	service, timer := RenderSystemd(binary)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(plan.Files[0], []byte(service), 0o644); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(plan.Files[1], []byte(timer), 0o644); err != nil {
+		return nil, err
+	}
+	return finishSystemd(plan)
+}
+
+// RenderSystemd builds the unit files. Exposed so their content can be checked
+// without installing anything.
+func RenderSystemd(binary string) (service, timer string) {
+	service = fmt.Sprintf(`[Unit]
 Description=ccvault: reconcile the Claude Code session index
 
 [Service]
@@ -52,7 +76,7 @@ Nice=10
 IOSchedulingClass=idle
 `, binary)
 
-	timer := fmt.Sprintf(`[Unit]
+	timer = fmt.Sprintf(`[Unit]
 Description=Run ccvault scan periodically
 
 [Timer]
@@ -64,25 +88,10 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 `, IntervalSeconds)
+	return service, timer
+}
 
-	plan := &Plan{Files: []string{
-		filepath.Join(dir, "ccvault-scan.service"),
-		filepath.Join(dir, "ccvault-scan.timer"),
-	}}
-	if dryRun {
-		return plan, nil
-	}
-
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(plan.Files[0], []byte(service), 0o644); err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(plan.Files[1], []byte(timer), 0o644); err != nil {
-		return nil, err
-	}
-
+func finishSystemd(plan *Plan) (*Plan, error) {
 	if err := run("systemctl", "--user", "daemon-reload"); err != nil {
 		plan.Hint = "wrote units, but `systemctl --user daemon-reload` failed; run it yourself"
 		return plan, nil
@@ -100,10 +109,38 @@ func installLaunchd(binary string, dryRun bool) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
-	const label = "com.sysn3rd.ccvault.scan"
-	path := filepath.Join(home, "Library", "LaunchAgents", label+".plist")
+	path := filepath.Join(home, "Library", "LaunchAgents", LaunchdLabel+".plist")
 
-	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+	plan := &Plan{Files: []string{path}}
+	if dryRun {
+		return plan, nil
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(path, []byte(RenderLaunchd(binary)), 0o644); err != nil {
+		return nil, err
+	}
+
+	// bootout first so a re-install replaces the old definition cleanly.
+	uid := fmt.Sprintf("gui/%d", os.Getuid())
+	_ = run("launchctl", "bootout", uid+"/"+LaunchdLabel)
+	if err := run("launchctl", "bootstrap", uid, path); err != nil {
+		plan.Hint = fmt.Sprintf("wrote the plist, but loading it failed; run: launchctl bootstrap %s %s", uid, path)
+		return plan, nil
+	}
+	plan.Enabled = true
+	return plan, nil
+}
+
+// LaunchdLabel identifies the macOS launch agent.
+const LaunchdLabel = "com.sysn3rd.ccvault.scan"
+
+// RenderLaunchd builds the launch agent plist. Exposed so its content can be
+// checked from any platform.
+func RenderLaunchd(binary string) string {
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -119,29 +156,7 @@ func installLaunchd(binary string, dryRun bool) (*Plan, error) {
   <key>Nice</key><integer>10</integer>
 </dict>
 </plist>
-`, label, binary, IntervalSeconds)
-
-	plan := &Plan{Files: []string{path}}
-	if dryRun {
-		return plan, nil
-	}
-
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(path, []byte(plist), 0o644); err != nil {
-		return nil, err
-	}
-
-	// bootout first so a re-install replaces the old definition cleanly.
-	uid := fmt.Sprintf("gui/%d", os.Getuid())
-	_ = run("launchctl", "bootout", uid+"/"+label)
-	if err := run("launchctl", "bootstrap", uid, path); err != nil {
-		plan.Hint = fmt.Sprintf("wrote the plist, but loading it failed; run: launchctl bootstrap %s %s", uid, path)
-		return plan, nil
-	}
-	plan.Enabled = true
-	return plan, nil
+`, LaunchdLabel, binary, IntervalSeconds)
 }
 
 func run(name string, args ...string) error {

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/sysn3rd/ccvault/internal/config"
+	"github.com/sysn3rd/ccvault/internal/gc"
 	"github.com/sysn3rd/ccvault/internal/hooks"
 	"github.com/sysn3rd/ccvault/internal/index"
 	"github.com/sysn3rd/ccvault/internal/ingest"
@@ -31,6 +32,7 @@ const usage = `ccvault — inventory and backup for Claude Code context
   ccvault restore <uuid>        Rebuild the session's directory, then resume
                                   [--to DIR] [--force] [--no-resume] [--fork] [-n]
   ccvault forget <uuid> [--yes] Drop a session from the vault (does not touch ~/.claude)
+  ccvault gc [-n] [--older-than DUR]  Reclaim space; never touches a live transcript
   ccvault status                Vault health
   ccvault install-hooks [-n]    Merge capture hooks into ~/.claude/settings.json
   ccvault install-timer [-n]    Install the periodic reconcile job (systemd / launchd)
@@ -67,6 +69,8 @@ func main() {
 		err = runRestore(args)
 	case "forget":
 		err = runForget(args)
+	case "gc":
+		err = runGC(args)
 	case "status":
 		err = runStatus(args)
 	case "install-hooks":
@@ -522,6 +526,57 @@ func runForget(args []string) error {
 		}
 	}
 	fmt.Printf("forgot %s (%d file(s) removed)\n", s.UUID[:8], removed)
+	return nil
+}
+
+func runGC(args []string) error {
+	fs := flag.NewFlagSet("gc", flag.ExitOnError)
+	dry := fs.Bool("n", false, "show what would be removed without removing it")
+	olderThan := fs.Duration("older-than", 0, "also prune supporting files older than this (e.g. 720h)")
+	fs.Parse(permute(fs, args))
+
+	cfg, db, err := open()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	plan, err := gc.Compute(cfg, db, gc.Options{OlderThan: *olderThan})
+	if err != nil {
+		return err
+	}
+	if len(plan.Candidates) == 0 && len(plan.Dangling) == 0 {
+		fmt.Println("nothing to collect")
+		return nil
+	}
+
+	for _, c := range plan.Candidates {
+		if c.Path == "" {
+			continue
+		}
+		fmt.Printf("  %-9s %s\n             %s\n", humanBytes(c.Bytes), filepath.Base(c.Path), c.Reason)
+	}
+	if n := len(plan.Dangling); n > 0 {
+		fmt.Printf("  %d index row(s) point at files that are already gone\n", n)
+	}
+	fmt.Printf("\nwould free %s\n", humanBytes(plan.FreedBytes))
+
+	if *dry {
+		fmt.Println("(dry run — nothing was removed)")
+		return nil
+	}
+
+	report, err := gc.Execute(db, plan)
+	if err != nil {
+		return err
+	}
+	for _, f := range report.Failed {
+		fmt.Printf("  ! %s\n", f)
+	}
+	if err := db.Vacuum(); err != nil {
+		fmt.Printf("  ! could not compact the index: %v\n", err)
+	}
+	fmt.Printf("removed %d file(s), freed %s\n", report.Removed, humanBytes(report.FreedBytes))
 	return nil
 }
 

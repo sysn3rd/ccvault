@@ -105,6 +105,7 @@ func (s *Session) GitRef() string {
 }
 
 type GitState struct {
+	ID               int64
 	SessionUUID      string
 	CapturedAt       time.Time
 	Event            string // "start" | "end" | "scan"
@@ -441,6 +442,93 @@ func scanSnapshots(rows *sql.Rows) ([]*Snapshot, error) {
 		out = append(out, s)
 	}
 	return out, rows.Err()
+}
+
+// ReferencedFiles is every vault path any row still points at. Anything in the
+// vault outside this set is an orphan and safe to delete.
+func (db *DB) ReferencedFiles() (map[string]bool, error) {
+	refs := map[string]bool{}
+	queries := []string{
+		`SELECT vault_path FROM sessions WHERE vault_path != ''`,
+		`SELECT patch_path FROM git_state WHERE patch_path IS NOT NULL AND patch_path != ''`,
+		`SELECT untracked_path FROM git_state WHERE untracked_path IS NOT NULL AND untracked_path != ''`,
+		`SELECT path FROM snapshots WHERE path != ''`,
+	}
+	for _, q := range queries {
+		rows, err := db.sql.Query(q)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var p string
+			if err := rows.Scan(&p); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			refs[p] = true
+		}
+		rows.Close()
+	}
+	return refs, nil
+}
+
+// StaleGitStates returns git captures beyond the newest `keep` for a session.
+// Every capture event may carry a patch and an untracked bundle, so without
+// pruning these grow once per session start and end, forever.
+func (db *DB) StaleGitStates(uuid string, keep int, before time.Time) ([]*GitState, error) {
+	q := `
+      SELECT id,session_uuid,captured_at,COALESCE(patch_path,''),COALESCE(untracked_path,'')
+      FROM git_state WHERE session_uuid = ?
+      ORDER BY captured_at DESC LIMIT -1 OFFSET ?`
+	rows, err := db.sql.Query(q, uuid, keep)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []*GitState
+	for rows.Next() {
+		g := &GitState{}
+		var ts int64
+		if err := rows.Scan(&g.ID, &g.SessionUUID, &ts, &g.PatchPath, &g.UntrackedPath); err != nil {
+			return nil, err
+		}
+		g.CapturedAt = time.Unix(ts, 0)
+		if !before.IsZero() && g.CapturedAt.After(before) {
+			continue
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+func (db *DB) DeleteGitState(id int64) error {
+	_, err := db.sql.Exec(`DELETE FROM git_state WHERE id = ?`, id)
+	return err
+}
+
+// UUIDs lists every indexed session id.
+func (db *DB) UUIDs() ([]string, error) {
+	rows, err := db.sql.Query(`SELECT uuid FROM sessions`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var u string
+		if err := rows.Scan(&u); err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+// Vacuum reclaims space after bulk deletions.
+func (db *DB) Vacuum() error {
+	_, err := db.sql.Exec(`VACUUM`)
+	return err
 }
 
 // Forget removes a session and everything stored for it, returning the vault
