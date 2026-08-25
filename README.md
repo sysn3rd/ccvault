@@ -42,13 +42,29 @@ whose exact commit is unrecoverable. That is the deadline this tool is racing.
 
 ## Install
 
-Requires **Go 1.25+** (pulled in by the pure-Go SQLite driver) and **git**. Works on Linux and macOS.
+### Pre-built binary (recommended)
+
+No Go toolchain needed.
+
+```sh
+mkdir -p ~/.local/bin
+curl -sSL https://github.com/sysn3rd/ccvault/releases/latest/download/ccvault_VERSION_linux_amd64.tar.gz \
+  | tar -xz -C ~/.local/bin ccvault
+```
+
+Replace `VERSION` with the release tag, and `linux_amd64` with `linux_arm64`, `darwin_amd64`
+or `darwin_arm64` as appropriate. Every release ships `SHA256SUMS` for verification. Make
+sure `~/.local/bin` is on your `PATH`.
+
+### From source
+
+Requires **Go 1.25+** (pulled in by the pure-Go SQLite driver) and **git**.
 
 ```sh
 go install github.com/sysn3rd/ccvault/cmd/ccvault@latest
 ```
 
-Or from source:
+Or:
 
 ```sh
 git clone https://github.com/sysn3rd/ccvault
@@ -56,7 +72,7 @@ cd ccvault
 go build -o ~/.local/bin/ccvault ./cmd/ccvault
 ```
 
-Make sure the install directory is on your `PATH`, then set it up:
+### Set it up
 
 ```sh
 ccvault install-hooks    # capture on session start and end
@@ -66,6 +82,8 @@ ccvault scan             # index everything already on disk
 
 Both installers are idempotent, accept `-n` for a dry run, and back up
 `~/.claude/settings.json` before touching it. `ccvault status` tells you where things stand.
+
+Works on Linux and macOS.
 
 ## Quickstart
 

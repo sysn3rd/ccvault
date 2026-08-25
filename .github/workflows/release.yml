@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          check-latest: true
+
+      # Never publish a build that does not pass its own tests.
+      - name: Test
+        run: |
+          git config --global user.email ci@example.com
+          git config --global user.name CI
+          go test ./...
+
+      - name: Build every supported platform
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            GOOS="${target%/*}"
+            GOARCH="${target#*/}"
+            echo "building ${GOOS}/${GOARCH}"
+            # -trimpath keeps local build paths out of the binary, -s -w drop the
+            # symbol table, and -X stamps the tag so `ccvault version` is useful.
+            CGO_ENABLED=0 GOOS="${GOOS}" GOARCH="${GOARCH}" go build \
+              -trimpath \
+              -ldflags "-s -w -X main.version=${VERSION}" \
+              -o dist/ccvault ./cmd/ccvault
+            tar -czf "dist/ccvault_${VERSION}_${GOOS}_${GOARCH}.tar.gz" \
+              -C dist ccvault \
+              -C "${GITHUB_WORKSPACE}" README.md LICENSE NOTICE
+            rm dist/ccvault
+          done
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Write release notes
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          {
+            echo "## Install"
+            echo
+            echo 'Pre-built binaries need no Go toolchain. Pick your platform below, or:'
+            echo
+            echo '```sh'
+            echo "mkdir -p ~/.local/bin"
+            echo "curl -sSL https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/ccvault_${VERSION}_linux_amd64.tar.gz \\"
+            echo "  | tar -xz -C ~/.local/bin ccvault"
+            echo "ccvault install-hooks && ccvault install-timer && ccvault scan"
+            echo '```'
+            echo
+            echo 'Replace `linux_amd64` with `linux_arm64`, `darwin_amd64` or `darwin_arm64` as needed.'
+            echo 'Verify downloads against `SHA256SUMS`.'
+            echo
+            echo 'Building from source requires Go 1.25+; these binaries do not.'
+            echo
+            echo "**Full changelog:** https://github.com/${GITHUB_REPOSITORY}/commits/${VERSION}"
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file release-notes.md \
+            dist/*.tar.gz dist/SHA256SUMS
